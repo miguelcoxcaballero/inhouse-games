@@ -27,7 +27,8 @@ async function unusedPort() {
 
 test.beforeAll(async () => {
   // The managed Chromium policy forbids non-proxied UDP. Exercise a real TURN
-  // TCP relay instead of overriding that policy or replacing RTCPeerConnection.
+  // TCP relay without overriding that policy. Both browser fixtures explicitly
+  // select relay ICE so CI with direct UDP available exercises the same path.
   const systemTurn = (process.env.PATH ?? '').split(path.delimiter).map((directory) => path.join(directory, 'turnserver')).find(existsSync);
   const unpackedRoot = path.resolve(process.cwd(), '..', '.tools', 'coturn');
   const executable = process.env.COTURN_BIN || systemTurn || path.join(unpackedRoot, 'usr', 'bin', 'turnserver');
@@ -81,13 +82,27 @@ test.afterAll(async () => {
   if (turnDirectory) await rm(turnDirectory, { recursive: true, force: true });
 });
 
+async function requireTurnRelay(page: Page) {
+  await page.addInitScript(() => {
+    const NativeRTCPeerConnection = window.RTCPeerConnection;
+    // This remains the browser's native WebRTC implementation: only its real
+    // ICE configuration is constrained. Media, SDP, transport and stats are not
+    // simulated. Otherwise CI may choose a direct route and never test TURN.
+    window.RTCPeerConnection = class extends NativeRTCPeerConnection {
+      constructor(configuration: RTCConfiguration = {}) {
+        super({ ...configuration, iceTransportPolicy: 'relay' });
+      }
+    };
+  });
+}
+
 /** Only screen acquisition and the Windows boundary are substituted. WebRTC,
  * signaling, encryption, data channels, encoding, decoding and stats stay real. */
 async function peer(browser: Browser, native = false, allowControl = true): Promise<Peer> {
-  // Expose real local ICE interfaces to Chromium rather than mDNS-only aliases;
-  // container multicast discovery is unavailable in this test environment.
+  // Isolated browser storage models separate physical participants.
   const context = await browser.newContext({ permissions: ['microphone', 'camera'] });
   const page = await context.newPage();
+  await requireTurnRelay(page);
   await installGoogleFixture(page, { signedIn: true, mockServiceSession: false });
   await page.addInitScript(({ signalingUrl, serviceToken }) => {
     localStorage.setItem('inhouse.signalingUrl', signalingUrl);
@@ -255,6 +270,7 @@ async function maxSenderBitrate(host: Peer) {
 async function uiPeer(browser: Browser, native: boolean): Promise<Peer> {
   const context = await browser.newContext({ permissions: ['microphone', 'camera'] });
   const page = await context.newPage();
+  await requireTurnRelay(page);
   await installGoogleFixture(page, { signedIn: true, mockServiceSession: false });
   await page.addInitScript(({ native, signalingUrl, serviceToken }) => {
     const w = window as any;
