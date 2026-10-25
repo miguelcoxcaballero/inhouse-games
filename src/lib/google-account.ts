@@ -1,6 +1,12 @@
 /** Google Identity Services, using the public web client shared by Notes/Read.
  * Only the Google account flow is shared; Link keeps its own token namespace.
  */
+import { bootstrapServiceConfig, getDefaultServiceOrigin, useCloudAccountTransport } from './service-config.ts';
+import {
+  CLOUD_ACCOUNT_KEY, clearCloudAccount, createCloudAccountFromRealm, getCloudAccount,
+  prepareCloudAccount, rememberCloudAccount, type CloudAccount,
+} from './cloud-account.ts';
+
 export const GOOGLE_CLIENT_ID = '435784295430-cmug30o42f1vu4ijgor9sjb0ro4oo37o.apps.googleusercontent.com';
 export const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 export const GOOGLE_SESSION_KEY = 'inhouse.link.google-session.v1';
@@ -14,7 +20,7 @@ export type AccountState = {
   profile: GoogleProfile | null;
   error: string | null;
 };
-export type GoogleSession = { accessToken: string; expiresAt: number; profile: GoogleProfile; issuer?: string };
+export type GoogleSession = { accessToken: string; expiresAt: number; profile: GoogleProfile; issuer?: string; kind?: 'cloud' };
 export type GoogleAccountOptions = { googleOnly?: boolean; exchangeServiceSession?: boolean };
 type OAuthResponse = { access_token?: string; expires_in?: number | string; scope?: string; error?: string; error_description?: string };
 type TokenClient = { requestAccessToken(options: { prompt: string; login_hint?: string }): void };
@@ -28,10 +34,15 @@ type GoogleOAuth = {
 type AccountWindow = Window & {
   google?: { accounts?: { oauth2?: GoogleOAuth } };
   inhouseDesktop?: {
-    googleSignIn?: () => Promise<{ accessToken: string; expiresAt: number }>;
+    googleSignIn?: (options?: { cloudMode?: boolean }) => Promise<{
+      accessToken: string; expiresAt: number; cloudRealm?: CloudRealm; profile?: GoogleProfile; cloudSessionExpiresAt?: number;
+    }>;
     googleSignOut?: () => void | Promise<void>;
+    cloudAccountRestore?: () => Promise<{ realm: CloudRealm; profile: GoogleProfile; expiresAt: number } | null>;
+    cloudAccountForget?: () => void | Promise<void>;
   };
 };
+type CloudRealm = { fileId: string; accountId: string; secret: string; id?: string };
 
 function accountWindow(): AccountWindow | null {
   return typeof window === 'undefined' ? null : window as unknown as AccountWindow;
@@ -54,12 +65,15 @@ function normalizedServiceOrigin(value: string): string | null {
   } catch { return null; }
 }
 
-/** Static Pages has no backend of its own; an explicit service is needed there. */
+/** A Node service is optional for Pages/Windows using the private account realm. */
 export function getConfiguredServiceOrigin(): string | null {
   let configured = '';
   try { configured = localStorage.getItem('inhouse.signalingUrl')?.trim() || ''; } catch { /* Optional persisted setting. */ }
   if (!configured) configured = import.meta.env?.VITE_SIGNALING_URL?.trim() || '';
   if (configured) return normalizedServiceOrigin(configured);
+  const defaultService = getDefaultServiceOrigin();
+  if (defaultService) return defaultService;
+  if (useCloudAccountTransport()) return null;
   const current = accountWindow()?.location ?? (typeof location !== 'undefined' ? location : null);
   if (!current || current.hostname.endsWith('.github.io') || current.hostname === 'github.io') return null;
   return normalizedServiceOrigin(current.origin);
@@ -82,6 +96,15 @@ export function getGoogleSession(): GoogleSession | null {
     if (!value || typeof value.accessToken !== 'string' || !value.accessToken || value.accessToken.length > 8192
       || typeof value.expiresAt !== 'number' || !Number.isFinite(value.expiresAt)
       || value.expiresAt <= Date.now() + EXPIRY_MARGIN || !validProfile(value.profile)) return null;
+    if (value.kind === 'cloud' || value.accessToken.startsWith('ild_')) {
+      if (value.kind !== 'cloud' || value.issuer !== undefined || !useCloudAccountTransport()) return null;
+      const cloud = getCloudAccount();
+      if (!cloud || cloud.clientToken !== value.accessToken || cloud.expiresAt !== value.expiresAt
+        || cloud.profile.id !== value.profile.id || cloud.profile.name !== value.profile.name
+        || cloud.profile.email !== value.profile.email || cloud.profile.photo !== value.profile.photo) return null;
+      return { kind: 'cloud', accessToken: cloud.clientToken, expiresAt: cloud.expiresAt, profile: { ...cloud.profile } };
+    }
+    if (value.kind !== undefined) return null;
     if (value.accessToken.startsWith('ihl_') || value.issuer) {
       if (!/^ihl_[A-Za-z0-9_-]{43}$/.test(value.accessToken) || typeof value.issuer !== 'string'
         || normalizedServiceOrigin(value.issuer) !== value.issuer || getConfiguredServiceOrigin() !== value.issuer) return null;
@@ -109,6 +132,7 @@ export function ensureServiceAccountSession(base: URL): Promise<GoogleSession> {
   if (!origin || origin !== getConfiguredServiceOrigin()) return Promise.reject(new Error('El servicio de conexión ha cambiado. Vuelve a iniciar sesión.'));
   const session = getGoogleSession();
   if (!session) return Promise.reject(new Error('Inicia sesión con Google para conectar este equipo.'));
+  if (session.kind === 'cloud') return Promise.reject(new Error('Vuelve a iniciar sesión con Google para autorizar un servidor propio.'));
   if (session.issuer) return Promise.resolve(session);
   if (exchange?.origin === origin && exchange.accessToken === session.accessToken && exchange.revision === sessionRevision) return exchange.promise;
   const revision = sessionRevision;
@@ -214,7 +238,7 @@ export class GoogleAccount {
   /** The desktop broker may hand off only a fresh Google grant, never ihl_. */
   getOAuthSession(): GoogleSession | null {
     const session = this.oauthSession;
-    return session && !session.issuer && !session.accessToken.startsWith('ihl_') && session.expiresAt > Date.now() + EXPIRY_MARGIN
+    return session && !session.kind && !session.issuer && !session.accessToken.startsWith('ihl_') && session.expiresAt > Date.now() + EXPIRY_MARGIN
       ? { ...session, profile: { ...session.profile } } : null;
   }
 
@@ -226,7 +250,7 @@ export class GoogleAccount {
   private storageChanged = (event: Event) => {
     if (this.googleOnly) return;
     const changed = event as StorageEvent;
-    if (changed.key === GOOGLE_SESSION_KEY || changed.key === null) {
+    if (changed.key === GOOGLE_SESSION_KEY || changed.key === CLOUD_ACCOUNT_KEY || changed.key === 'inhouse.signalingUrl' || changed.key === null) {
       const next = getGoogleSession();
       if (!next || next.profile.id !== this.current.profile?.id) emit('signed-out', null);
       void this.initialize();
@@ -259,14 +283,35 @@ export class GoogleAccount {
     this.cancel();
     const run = this.generation;
     this.change({ status: 'loading', profile: null, error: null });
-    const saved = getGoogleSession();
-    const session = this.googleOnly && saved?.issuer ? null : saved;
+    if (!this.googleOnly) await bootstrapServiceConfig();
+    if (run !== this.generation || this.destroyed) return;
     const desktop = accountWindow()?.inhouseDesktop;
+    if (!this.googleOnly && useCloudAccountTransport() && desktop) {
+      try {
+        // A renderer cache cannot recreate the native authorization anchor.
+        const restored = await desktop.cloudAccountRestore?.();
+        if (run !== this.generation || this.destroyed) return;
+        if (restored) {
+          this.activateCloud(createCloudAccountFromRealm(restored.profile, restored.realm, restored.expiresAt), run, 'refreshed');
+          return;
+        }
+        this.clearStored();
+        this.change({ status: 'signed-out', profile: null, error: null });
+        emit('signed-out', null);
+      } catch (error) { if (run === this.generation) this.rejectSession(error); }
+      return;
+    }
+    const saved = getGoogleSession();
+    const session = this.googleOnly && (saved?.issuer || saved?.kind === 'cloud') ? null : saved;
     if (session) {
       // SDK loading is independent from a restored token's Google validation.
       if (!desktop) void loadGoogleSdk().catch(() => {});
       try {
-        if (session.issuer) await this.acceptService(session, run);
+        if (session.kind === 'cloud') {
+          this.change({ status: 'signed-in', profile: session.profile, error: null });
+          emit('refreshed', session.profile);
+          this.scheduleExpiry(session.expiresAt, run);
+        } else if (session.issuer) await this.acceptService(session, run);
         else await this.accept(session.accessToken, session.expiresAt, run, 'refreshed');
       }
       catch (error) {
@@ -281,7 +326,7 @@ export class GoogleAccount {
       return;
     }
     if (!this.googleOnly) {
-      try { localStorage.removeItem(GOOGLE_SESSION_KEY); } catch { /* No stored login. */ }
+      this.clearStored();
       emit('signed-out', null);
     }
     try {
@@ -326,9 +371,15 @@ export class GoogleAccount {
         this.change({ status: 'error', profile: null, error: error.message });
         return Promise.reject(error);
       }
-      return desktop.googleSignIn().then(async (result) => {
+      const cloudMode = !this.googleOnly && useCloudAccountTransport();
+      return desktop.googleSignIn({ cloudMode }).then(async (result) => {
         if (run !== this.generation) throw new Error('La conexión de Google se ha cancelado.');
-        await this.accept(result.accessToken, result.expiresAt, run, 'signed-in');
+        if (cloudMode && (!result.cloudRealm || !result.profile || typeof result.cloudSessionExpiresAt !== 'number')) {
+          throw new Error('Actualiza la aplicación de Windows para conectar mediante tu cuenta de Google.');
+        }
+        await this.accept(result.accessToken, result.expiresAt, run, 'signed-in', cloudMode ? {
+          realm: result.cloudRealm!, profile: result.profile!, expiresAt: result.cloudSessionExpiresAt!,
+        } : undefined);
       }).catch((error: unknown) => {
         if (run === this.generation) this.rejectSession(error);
         throw error;
@@ -399,7 +450,7 @@ export class GoogleAccount {
     });
   }
 
-  private async accept(accessToken: string, expiresAt: number, run: number, reason: 'signed-in' | 'refreshed') {
+  private async accept(accessToken: string, expiresAt: number, run: number, reason: 'signed-in' | 'refreshed', nativeCloud?: { realm: CloudRealm; profile: GoogleProfile; expiresAt: number }) {
     if (typeof accessToken !== 'string' || !accessToken || accessToken.length > 8192
       || typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= Date.now() + EXPIRY_MARGIN) {
       throw new Error('Google no devolvió una sesión válida. Vuelve a iniciar sesión.');
@@ -435,6 +486,17 @@ export class GoogleAccount {
       this.scheduleExpiry(expiresAt, run);
       return;
     }
+    if (useCloudAccountTransport()) {
+      if (nativeCloud) normalizedServerProfile(nativeCloud.profile, profile);
+      const cloud = nativeCloud
+        ? createCloudAccountFromRealm(profile, nativeCloud.realm, nativeCloud.expiresAt)
+        : await prepareCloudAccount(accessToken, profile);
+      if (run !== this.generation || this.destroyed || !useCloudAccountTransport()) throw new Error('La conexión de la cuenta ha cambiado.');
+      this.oauthSession = null;
+      this.activateCloud(cloud, run, reason);
+      return;
+    }
+    if (nativeCloud) throw new Error('El servicio de conexión ha cambiado. Vuelve a iniciar sesión.');
     localStorage.setItem(GOOGLE_SESSION_KEY, JSON.stringify(verified));
     let active = verified;
     let serviceError: string | null = null;
@@ -452,9 +514,22 @@ export class GoogleAccount {
     this.scheduleExpiry(active.expiresAt, run);
   }
 
+  private activateCloud(cloud: CloudAccount, run: number, reason: 'signed-in' | 'refreshed') {
+    if (run !== this.generation || this.destroyed || !useCloudAccountTransport()) throw new Error('La conexión de la cuenta ha cambiado.');
+    this.oauthSession = null;
+    rememberCloudAccount(cloud);
+    const session: GoogleSession = { kind: 'cloud', accessToken: cloud.clientToken, expiresAt: cloud.expiresAt, profile: cloud.profile };
+    try { localStorage.setItem(GOOGLE_SESSION_KEY, JSON.stringify(session)); }
+    catch (error) { clearCloudAccount(); throw error; }
+    this.change({ status: 'signed-in', profile: cloud.profile, error: null });
+    emit(reason, cloud.profile);
+    this.scheduleExpiry(cloud.expiresAt, run);
+  }
+
   private scheduleExpiry(expiresAt: number, run: number) {
     if (this.expiryTimer) clearTimeout(this.expiryTimer);
-    const serviceSession = !this.googleOnly && !!getGoogleSession()?.issuer;
+    const session = !this.googleOnly ? getGoogleSession() : null;
+    const durableSession = !!session && (!!session.issuer || session.kind === 'cloud');
     const delay = Math.max(0, Math.min(2_000_000_000, expiresAt - Date.now() - EXPIRY_MARGIN));
     this.expiryTimer = setTimeout(() => {
       this.expiryTimer = null;
@@ -464,20 +539,23 @@ export class GoogleAccount {
         return;
       }
       const api = googleApi();
-      if (!serviceSession && !accountWindow()?.inhouseDesktop && api?.initTokenClient && !this.silent) {
+      if (!durableSession && !accountWindow()?.inhouseDesktop && api?.initTokenClient && !this.silent) {
         this.silent = true;
         void this.requestWeb(api, run, true).catch(() => {}).finally(() => { this.silent = false; });
       } else {
         this.cancel();
         this.oauthSession = null;
         if (!this.googleOnly) this.clearStored();
-        this.change({ status: 'signed-out', profile: null, error: 'La sesión de Google ha caducado. Vuelve a iniciar sesión.' });
+        this.change({ status: 'signed-out', profile: null, error: 'La sesión de tu cuenta ha caducado. Vuelve a iniciar sesión con Google.' });
         if (!this.googleOnly) emit('expired', null);
       }
     }, delay);
   }
 
-  private clearStored() { try { localStorage.removeItem(GOOGLE_SESSION_KEY); } catch { /* No persisted session. */ } }
+  private clearStored() {
+    clearCloudAccount();
+    try { localStorage.removeItem(GOOGLE_SESSION_KEY); } catch { /* No persisted session. */ }
+  }
 
   private rejectSession(error: unknown) {
     this.oauthSession = null;
@@ -502,7 +580,12 @@ export class GoogleAccount {
       }).catch(() => {});
     }
     // Match Read: sign out of this app, without revoking the shared Notes grant.
-    try { if (!this.googleOnly) void Promise.resolve(accountWindow()?.inhouseDesktop?.googleSignOut?.()).catch(() => {}); }
+    try {
+      if (!this.googleOnly) {
+        void Promise.resolve(accountWindow()?.inhouseDesktop?.cloudAccountForget?.()).catch(() => {});
+        void Promise.resolve(accountWindow()?.inhouseDesktop?.googleSignOut?.()).catch(() => {});
+      }
+    }
     catch { /* Local state has already been cleared. */ }
   }
 

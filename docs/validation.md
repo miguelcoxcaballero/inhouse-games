@@ -1,4 +1,34 @@
-# Resultado de la validación · 0.2
+# Resultado de la validación · 0.3
+
+Validado en el entorno cloud Linux el 25 de octubre de 2026. Las comprobaciones locales y las de publicación se distinguen de las pruebas pendientes en los PCs físicos.
+
+| Comprobación | Resultado |
+|---|---|
+| `npm test` | **166 aprobadas**, 0 fallidas, 0 omitidas. |
+| `npm run typecheck` y `git diff --check` | Aprobados. |
+| Suite completa Playwright de cuenta y streaming | **29 aprobadas**, 0 fallidas, 0 omitidas, en 1,9 min. |
+| Repetición final de cuenta/descubrimiento/autorización | **5 aprobadas**, 0 fallidas, en 45,3 s. |
+| MQTT con las cabeceras de producción | Aprobado en 8,1 s: worker real, conexión, publicación/suscripción y al menos dos PINGREQ durante inactividad. |
+| Integridad de publicación y catálogo | **9 aprobadas**, 0 fallidas. |
+| Google, caché privada y selección de transporte | 60 pruebas incluidas en las 166. |
+| Realm privado de Drive y criptografía | 13 pruebas incluidas. |
+| Broker MQTT local real y protocolo cifrado | 7 pruebas incluidas. |
+| Autorización nativa de cuenta y sesión protegida | 30 pruebas incluidas. |
+
+Las pruebas comprueban descubrimiento entre dispositivos de la misma cuenta, conexión sin aceptación, renovación de la autorización nativa, desconexión y reconexión, aislamiento entre cuentas y rechazo de pruebas alteradas. La identidad creada de forma concurrente conserva un único dispositivo y produce firmas independientes válidas.
+
+Tres casos cloud utilizan un broker MQTT local real. El cliente web tiene origen HTTPS de Pages, activos reales de Vite y ninguna API nativa de escritorio. Se sustituye Google/Drive por respuestas de prueba; el anfitrión delega la verificación criptográfica en el módulo real del proceso principal. Se transportan vídeo codificado/decodificado, audio y controles reales. Una prueba de privacidad publica un anuncio firmado válido de otra cuenta cifrado con su propia clave y verifica que no aparece ni permite control.
+
+Chromium tiene una política gestionada que impide UDP no enviado mediante proxy. Se respeta utilizando **coturn TCP real en loopback**, sin cambiar políticas de WebRTC. La adquisición de pantalla se sustituye por canvas animado y audio sintético. La frontera de entrada registra las llamadas que llegarían a Win32. Esto no valida captura física, audio loopback, inyección Win32 ni compatibilidad con juegos.
+
+La política de red del entorno impide comprobar el broker público Shiftr. Siguen pendientes el consentimiento con Google real, el servicio público desde las redes del usuario, instalación/captura/control en Windows físico y el enlace Murcia–Valencia. No se ha demostrado superioridad frente a Parsec. El modo predeterminado no incluye TURN público; algunas redes restrictivas pueden impedir el enlace. HDR, 4:4:4, mandos y monitor virtual siguen pendientes.
+
+## Artefactos de 0.3
+
+El instalador NSIS y el portable se compilan desde las fuentes y se verifican antes de publicar. Cada archivo distribuido incluye SHA-256. El paquete web incluye el cliente y Node opcional; el paquete fuente excluye secretos, dependencias y binarios generados. Los resultados finales de compilación y publicación se añaden al completar esas operaciones.
+
+## Validación anterior · 0.2
+
 
 Validado en el entorno cloud Linux el 25 de octubre de 2026. Los resultados describen esta ejecución y sus artefactos; no una instalación ya publicada ni los equipos físicos del usuario.
 

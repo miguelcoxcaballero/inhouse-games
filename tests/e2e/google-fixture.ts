@@ -9,6 +9,11 @@ export const GOOGLE_TEST_PROFILE = {
   id: 'e2e-google-account', name: 'Cuenta de pruebas',
   email: 'inhouse-e2e@example.test', photo: '',
 };
+export const GOOGLE_OTHER_TEST_TOKEN = 'e2e-google-access-token-guest-inhouse-link';
+export const GOOGLE_OTHER_TEST_PROFILE = {
+  id: 'e2e-other-google-account', name: 'Cuenta invitada de pruebas',
+  email: 'guest-e2e@example.test', photo: '',
+};
 
 type Options = {
   signedIn?: boolean;
@@ -25,6 +30,11 @@ export async function installGoogleFixture(page: Page, options: Options = {}) {
   const profile = options.profile ?? GOOGLE_TEST_PROFILE;
   const profiles = new Map([[token, profile], ...Object.entries(options.accounts ?? {})]);
   const serviceSessions = new Map<string, { accessToken: string; expiresAt: number; profile: typeof GOOGLE_TEST_PROFILE }>();
+  // Packaged Windows reads its public discovery document from Pages. Keep that
+  // network document deterministic; each media fixture selects its real service.
+  await page.route('https://miguelcoxcaballero.github.io/inhouse-games/service.json', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ schema: 1, signalingUrl: null }),
+  }));
   const sdk = `(${String((config: { token: string; error?: string }) => {
     const w = window as any;
     w.__googleInitCalls = [];

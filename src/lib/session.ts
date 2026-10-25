@@ -1,5 +1,8 @@
 import { collectSessionStats, EMPTY_STATS, type SessionStats, type StatsSample } from './stats';
-import { ensureServiceAccountSession, getGoogleSession } from './google-account.ts';
+import { ensureServiceAccountSession, getConfiguredServiceOrigin, getGoogleSession } from './google-account.ts';
+import { getCloudAccount } from './cloud-account';
+import { useCloudAccountTransport } from './service-config';
+import { getCloudHub, type CloudSocket } from './cloud-signal';
 import {
   base64url, clearTrustedDevices, createCredential, forgetTrustedHost, getTrustedDevices, getTrustedHosts, getTrustRevision,
   identityForNonce, prove, saveDevice, saveHost, storedDevices, storedHosts, verifyProof,
@@ -30,6 +33,7 @@ export type LinkState = {
   remoteStream: MediaStream | null;
   localStream: MediaStream | null;
   controlEnabled: boolean;
+  accountHosting?: boolean;
 };
 
 export type DesktopBridge = {
@@ -39,6 +43,17 @@ export type DesktopBridge = {
   injectInput(event: Record<string, unknown>): void;
   releaseInputs(): void;
   captureEnded?(): void;
+  enableAccountHosting?(options: { issuer: string; accessToken: string; serviceKey?: string; hostId: string }): Promise<boolean>;
+  getAccountCaptureSource?(): Promise<{ sourceId: string } | null>;
+  authorizeAccountPeer?(connectionId: string): Promise<boolean>;
+  endAccountPeer?(): void;
+  disableAccountHosting?(): void;
+  getComputerName?(): Promise<string>;
+  onAccountHostingRevoked?(callback: (reason: string) => void): () => void;
+  onAccountPeerRevoked?(callback: (reason: string) => void): () => void;
+  enableCloudAccountHosting?(options: { accountId: string; hostId: string }): Promise<{ challenge: string } | null>;
+  authorizeCloudPeer?(proof: unknown): Promise<boolean>;
+  renewCloudPeer?(proof: unknown): Promise<boolean>;
 };
 
 declare global {
@@ -53,7 +68,7 @@ export const DEFAULT_SETTINGS: LinkSettings = {
 
 const INITIAL_STATE: LinkState = {
   status: 'idle', role: null, code: '', deviceId: '', error: null, peerName: '', requests: [],
-  stats: { ...EMPTY_STATS }, remoteStream: null, localStream: null, controlEnabled: false,
+  stats: { ...EMPTY_STATS }, remoteStream: null, localStream: null, controlEnabled: false, accountHosting: false,
 };
 const RESOLUTIONS = { '1080p': [1920, 1080], '1440p': [2560, 1440], '4k': [3840, 2160] } as const;
 
@@ -75,8 +90,9 @@ function message(error: unknown) {
 }
 
 function endpoint() {
-  const saved = localStorage.getItem('inhouse.signalingUrl')?.trim();
-  const base = new URL(saved || import.meta.env?.VITE_SIGNALING_URL || location.origin);
+  const origin = getConfiguredServiceOrigin();
+  if (!origin) throw new Error('El servicio remoto no está configurado. Actívalo para que tus equipos compartan la misma lista; GitHub Pages aloja la web del cliente.');
+  const base = new URL(origin);
   if (base.username || base.password || !['https:', 'http:'].includes(base.protocol)) {
     throw new Error('La dirección del servidor debe ser una URL HTTPS sin credenciales.');
   }
@@ -106,7 +122,7 @@ export function isValidInput(event: unknown): event is Record<string, unknown> {
 export class LinkSession {
   private current: LinkState = { ...INITIAL_STATE, stats: { ...EMPTY_STATS } };
   private settings: LinkSettings = { ...DEFAULT_SETTINGS };
-  private socket: WebSocket | null = null;
+  private socket: WebSocket | CloudSocket | null = null;
   private peer: RTCPeerConnection | null = null;
   private control: RTCDataChannel | null = null;
   private pointer: RTCDataChannel | null = null;
@@ -139,6 +155,13 @@ export class LinkSession {
   private reconnectingHost = false;
   private hostReconnectPending = false;
   private accountId = '';
+  private accountHosting = false;
+  private hostName = 'PC Inhouse';
+  private cloudMode = false;
+  private nativeCloudChallenge = '';
+  private activeConnectionId = '';
+  private removeHostingRevoked: (() => void) | undefined;
+  private removePeerRevoked: (() => void) | undefined;
   private accountChanged = () => {
     const account = getGoogleSession();
     if (this.current.role && (!account || account.profile.id !== this.accountId)) this.disconnect();
@@ -146,6 +169,12 @@ export class LinkSession {
 
   constructor(private onChange: (state: LinkState) => void) {
     window.addEventListener('inhouse-account-changed', this.accountChanged);
+    this.removeHostingRevoked = window.inhouseDesktop?.onAccountHostingRevoked?.(reason => {
+      if (this.accountHosting) this.fail(reason || 'Vuelve a iniciar sesión para dejar este PC disponible.');
+    });
+    this.removePeerRevoked = window.inhouseDesktop?.onAccountPeerRevoked?.(reason => {
+      if (this.accountHosting) this.disconnectPeer(reason || 'La sesión de control ha terminado.');
+    });
   }
 
   get state() { return this.current; }
@@ -155,22 +184,57 @@ export class LinkSession {
     if (!this.destroyed) this.onChange(this.current);
   }
 
-  async host(settings: LinkSettings): Promise<void> {
+  async host(settings: LinkSettings, options: { accountHosting?: boolean; name?: string } = {}): Promise<void> {
     this.disconnect();
     const account = getGoogleSession();
     if (!account) { this.fail('Inicia sesión con tu cuenta de Google para compartir este PC.'); return; }
     this.accountId = account.profile.id;
+    this.accountHosting = options.accountHosting === true;
+    this.hostName = options.name?.trim().slice(0, 64) || 'PC Inhouse';
     const run = this.generation;
     this.settings = validSettings(settings) ?? { ...DEFAULT_SETTINGS };
     this.adaptiveBitrate = this.settings.bitrate;
-    this.change({ ...INITIAL_STATE, role: 'host', status: 'connecting', stats: { ...EMPTY_STATS } });
+    this.change({ ...INITIAL_STATE, role: 'host', status: 'connecting', accountHosting: this.accountHosting, stats: { ...EMPTY_STATS } });
     try {
       if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Este entorno no permite capturar pantalla. Usa la aplicación de Windows.');
-      // Request capture before the first network await so the user gesture remains valid.
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: this.settings.fps, max: this.settings.fps } },
-        audio: this.settings.audio,
-      });
+      let stream: MediaStream;
+      if (this.accountHosting) {
+        const native = window.inhouseDesktop;
+        if (!native?.getAccountCaptureSource) throw new Error('Actualiza la app de Windows para disponer de acceso con tu cuenta.');
+        await this.connect(run);
+        const identity = await identityForNonce(this.connectionNonce);
+        if (run !== this.generation) return;
+        const session = getGoogleSession();
+        if (!session || session.profile.id !== this.accountId) throw new Error('Vuelve a iniciar sesión con Google.');
+        let allowed = false;
+        if (this.cloudMode) {
+          const grant = await native.enableCloudAccountHosting?.({ accountId: this.accountId, hostId: identity.deviceId });
+          allowed = !!grant?.challenge;
+          this.nativeCloudChallenge = grant?.challenge || '';
+        } else if (this.serverBase && native.enableAccountHosting) {
+          allowed = await native.enableAccountHosting({ issuer: this.serverBase.origin, accessToken: session.accessToken,
+            serviceKey: localStorage.getItem('inhouse.serviceToken')?.trim() || '', hostId: identity.deviceId });
+        }
+        if (run !== this.generation) return;
+        if (!allowed) throw new Error('No se ha podido verificar la cuenta propietaria de este PC.');
+        const source = await native.getAccountCaptureSource();
+        if (!source || run !== this.generation) throw new Error('No se ha podido preparar la pantalla de este PC.');
+        const constraints = {
+          video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: source.sourceId,
+            maxFrameRate: this.settings.fps } },
+          audio: this.settings.audio ? { mandatory: { chromeMediaSource: 'desktop' } } : false,
+        } as unknown as MediaStreamConstraints;
+        try { stream = await navigator.mediaDevices.getUserMedia(constraints); }
+        catch (error) {
+          if (!this.settings.audio) throw error;
+          stream = await navigator.mediaDevices.getUserMedia({ ...constraints, audio: false });
+        }
+      } else {
+        // Manual/browser capture preserves the initiating user gesture.
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: { ideal: this.settings.fps, max: this.settings.fps } }, audio: this.settings.audio,
+        });
+      }
       if (run !== this.generation) { stream.getTracks().forEach((track) => track.stop()); return; }
       const capturedVideo = stream.getVideoTracks()[0];
       if (capturedVideo) capturedVideo.contentHint = 'motion';
@@ -179,8 +243,10 @@ export class LinkSession {
         if (this.current.localStream === stream) this.disconnect();
       }, { once: true });
       // This local, native consent remains valid only while this capture stays active.
-      await this.setControlEnabled(true);
-      await this.connect(run);
+      if (!this.accountHosting) {
+        await this.setControlEnabled(true);
+        await this.connect(run);
+      }
       if (run === this.generation) await this.registerHost(run);
     } catch (error) { if (run === this.generation) this.fail(message(error)); }
   }
@@ -193,7 +259,9 @@ export class LinkSession {
     const run = this.generation;
     this.settings = validSettings(settings) ?? { ...DEFAULT_SETTINGS };
     const cleanCode = code.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-    if (!cleanCode || (cleanCode.length > 16 && !/^[A-F0-9]{32}$/.test(cleanCode))) { this.fail('Introduce un código de conexión válido.'); return; }
+    if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/.test(cleanCode) && !/^[A-F0-9]{32}$/.test(cleanCode)) {
+      this.fail('Introduce un código de conexión válido de ocho caracteres o elige un equipo de tu cuenta.'); return;
+    }
     this.expectedTrustedHost = storedHosts().find((host) => host.deviceId === cleanCode.toLowerCase()) ?? null;
     this.change({ ...INITIAL_STATE, role: 'viewer', status: 'connecting', code: cleanCode, stats: { ...EMPTY_STATS } });
     try {
@@ -209,29 +277,38 @@ export class LinkSession {
   }
 
   private async connect(run: number): Promise<void> {
-    const base = endpoint();
-    this.serverBase = base;
-    const serviceToken = localStorage.getItem('inhouse.serviceToken')?.trim();
-    const account = await ensureServiceAccountSession(base);
-    if (!account || account.profile.id !== this.accountId) throw new Error('La sesión de Google ha caducado o ha cambiado. Vuelve a iniciar sesión.');
-    if (run !== this.generation) return;
-    const response = await fetch(new URL('/api/config', base), {
-      credentials: 'omit', signal: AbortSignal.timeout(12000),
-      headers: { Authorization: `Bearer ${account.accessToken}`, ...(serviceToken ? { 'X-Inhouse-Service-Key': serviceToken } : {}) },
-    });
-    if (!response.ok) throw new Error(`El servidor de conexión respondió ${response.status}.`);
-    const config = await response.json() as { iceServers?: RTCIceServer[]; iceExpiresAt?: number | null };
-    if (run !== this.generation) return;
-    const servers = config.iceServers;
-    this.iceServers = Array.isArray(servers) ? servers : [];
-    this.scheduleIceRefresh(config.iceExpiresAt, run);
-    const url = new URL('/signal', base);
-    url.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
-    await new Promise<void>((resolve, reject) => {
-      const protocols = ['inhouse-link-v1'];
-      protocols.push(`google.${base64url(new TextEncoder().encode(account.accessToken))}`);
+    this.cloudMode = useCloudAccountTransport();
+    let socket: WebSocket | CloudSocket;
+    if (this.cloudMode) {
+      const cloud = getCloudAccount();
+      if (!cloud || cloud.profile.id !== this.accountId) throw new Error('Vuelve a iniciar sesión con Google para conectar con tus equipos.');
+      this.serverBase = null;
+      this.iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+      socket = await getCloudHub(cloud).createSocket();
+      if (run !== this.generation) { socket.close(); return; }
+    } else {
+      const base = endpoint();
+      this.serverBase = base;
+      const serviceToken = localStorage.getItem('inhouse.serviceToken')?.trim();
+      const account = await ensureServiceAccountSession(base);
+      if (!account || account.profile.id !== this.accountId) throw new Error('La sesión de Google ha caducado o ha cambiado. Vuelve a iniciar sesión.');
+      if (run !== this.generation) return;
+      const response = await fetch(new URL('/api/config', base), {
+        credentials: 'omit', signal: AbortSignal.timeout(12000),
+        headers: { Authorization: `Bearer ${account.accessToken}`, ...(serviceToken ? { 'X-Inhouse-Service-Key': serviceToken } : {}) },
+      });
+      if (!response.ok) throw new Error(`El servidor de conexión respondió ${response.status}.`);
+      const config = await response.json() as { iceServers?: RTCIceServer[]; iceExpiresAt?: number | null };
+      if (run !== this.generation) return;
+      this.iceServers = Array.isArray(config.iceServers) ? config.iceServers : [];
+      this.scheduleIceRefresh(config.iceExpiresAt, run);
+      const url = new URL('/signal', base);
+      url.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+      const protocols = ['inhouse-link-v1', `google.${base64url(new TextEncoder().encode(account.accessToken))}`];
       if (serviceToken) protocols.push(`auth.${base64url(new TextEncoder().encode(serviceToken))}`);
-      const socket = new WebSocket(url, protocols);
+      socket = new WebSocket(url, protocols);
+    }
+    await new Promise<void>((resolve, reject) => {
       this.socket = socket;
       let opened = false;
       let greeted = false;
@@ -246,7 +323,7 @@ export class LinkSession {
           else this.fail('Se ha perdido la conexión con el servidor.');
         }
       };
-      socket.onmessage = (event) => {
+      socket.onmessage = (event: { data: unknown }) => {
         if (typeof event.data !== 'string' || event.data.length > 256000) return;
         let parsed: Record<string, unknown>;
         try { parsed = JSON.parse(event.data) as Record<string, unknown>; } catch { return; }
@@ -271,7 +348,8 @@ export class LinkSession {
     if (run !== this.generation) return;
     if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('El servicio se desconectó antes de registrar este PC.');
     this.change({ deviceId: identity.deviceId });
-    this.sendSignal({ type: 'host', name: 'PC Inhouse', identity: identity.identity });
+    this.sendSignal({ type: 'host', name: this.hostName, identity: identity.identity,
+      ...(this.nativeCloudChallenge ? { nativeChallenge: this.nativeCloudChallenge } : {}) });
   }
 
   /** A signaling outage never silently ends an already approved local capture. */
@@ -374,7 +452,8 @@ export class LinkSession {
           this.approvalInFlight = true;
           this.activeTrustedDevice = { ...trusted, nonce: trust.nonce };
           this.sendSignal({ type: 'approve', id: String(data.id), allow: true });
-        } else this.change({ requests: [...this.current.requests.filter((r) => r.id !== data.id), { id: String(data.id), name: String(data.name || 'Portátil') }] });
+        } else if (data.trustedOnly === true) this.sendSignal({ type: 'approve', id: String(data.id), allow: false });
+        else this.change({ requests: [...this.current.requests.filter((r) => r.id !== data.id), { id: String(data.id), name: String(data.name || 'Portátil') }] });
         break;
       }
       case 'request-expired':
@@ -383,9 +462,31 @@ export class LinkSession {
         break;
       case 'paired': {
         this.approvalInFlight = false;
+        const remoteAccount = data.account as { id?: unknown } | undefined;
+        const ownAccount = data.accountAuthorized === true && remoteAccount?.id === this.accountId;
+        if (data.accountAuthorized === true && !ownAccount) throw new Error('La cuenta del equipo remoto no coincide con tu sesión.');
+        if (ownAccount) {
+          this.expectedTrustedHost = null; this.activeTrustedDevice = null; this.trustToCreate = null;
+          this.trustedHostVerified = false;
+        }
         if (this.expectedTrustedHost && data.deviceId !== this.expectedTrustedHost.deviceId) throw new Error('La identidad del PC remoto no coincide con el equipo emparejado.');
-        this.change({ status: 'negotiating', deviceId: typeof data.deviceId === 'string' ? data.deviceId : this.current.deviceId, peerName: String(data.name || 'Equipo remoto'), requests: [], error: null });
+        this.change({ status: 'negotiating', deviceId: typeof data.deviceId === 'string' ? data.deviceId : this.current.deviceId,
+          peerName: String(data.deviceName || data.name || 'Equipo remoto'), requests: [], error: null });
         const peer = this.createPeer(run);
+        this.activeConnectionId = typeof data.connectionId === 'string' ? data.connectionId : '';
+        if (this.current.role === 'host' && ownAccount && this.cloudMode) {
+          const allowed = await window.inhouseDesktop?.authorizeCloudPeer?.(data.accountProof) ?? false;
+          if (run !== this.generation || peer !== this.peer) return;
+          if (!allowed) { this.disconnectPeer('No se ha podido verificar el acceso de tu cuenta a este PC.'); return; }
+          await this.setControlEnabled(true);
+        } else if (this.current.role === 'host' && ownAccount && window.inhouseDesktop?.authorizeAccountPeer) {
+          const allowed = !!this.activeConnectionId && await window.inhouseDesktop.authorizeAccountPeer(this.activeConnectionId);
+          if (run !== this.generation || peer !== this.peer) return;
+          if (!allowed) { this.disconnectPeer('No se ha podido verificar el permiso de esta conexión.'); return; }
+          await this.setControlEnabled(true);
+        } else if (this.current.role === 'host' && this.accountHosting) {
+          if (ownAccount) throw new Error('Esta versión de Windows no puede verificar el acceso con tu cuenta.');
+        }
         if (data.initiator) {
           this.bindChannel(peer.createDataChannel('control', { ordered: true }));
           this.bindChannel(peer.createDataChannel('pointer', { ordered: false, maxRetransmits: 0 }));
@@ -396,6 +497,15 @@ export class LinkSession {
           this.applyCodecPreference();
           await peer.setLocalDescription(await peer.createOffer());
           if (run === this.generation && peer === this.peer) this.sendSignal({ type: 'signal', signal: { description: peer.localDescription } });
+        }
+        break;
+      }
+      case 'account-keepalive': {
+        const proof = data.proof as { connectionId?: unknown } | undefined;
+        if (this.cloudMode && this.current.role === 'host' && this.accountHosting && proof?.connectionId === this.activeConnectionId) {
+          const connectionId = this.activeConnectionId;
+          const allowed = await window.inhouseDesktop?.renewCloudPeer?.(data.proof) ?? false;
+          if (!allowed && run === this.generation && connectionId === this.activeConnectionId) this.disconnectPeer('La conexión de tu cuenta ha terminado.');
         }
         break;
       }
@@ -423,6 +533,7 @@ export class LinkSession {
       case 'peer-left':
         this.approvalInFlight = false;
         this.closePeer(false);
+        if (this.accountHosting) { window.inhouseDesktop?.endAccountPeer?.(); this.hostControlEnabled = false; }
         this.activeTrustedDevice = null;
         this.trustToCreate = null;
         this.change({ status: this.current.role === 'host' && this.current.localStream ? 'hosting' : 'disconnected', remoteStream: null, controlEnabled: this.current.role === 'host' && this.hostControlEnabled, peerName: '', stats: { ...EMPTY_STATS } });
@@ -438,6 +549,17 @@ export class LinkSession {
         this.fail(typeof data.message === 'string' ? data.message : 'El equipo remoto rechazó la conexión.');
         break;
     }
+  }
+
+  /** End one viewer without taking the signed-in PC out of the account list. */
+  disconnectPeer(reason: string | null = null) {
+    if (this.current.role !== 'host' || !this.current.localStream?.active) { this.disconnect(); return; }
+    this.sendSignal({ type: 'disconnect-peer' });
+    this.closePeer(false);
+    if (this.accountHosting) { window.inhouseDesktop?.endAccountPeer?.(); this.hostControlEnabled = false; }
+    this.activeTrustedDevice = null; this.trustToCreate = null;
+    this.change({ status: 'hosting', peerName: '', requests: [], remoteStream: null, controlEnabled: this.hostControlEnabled,
+      stats: { ...EMPTY_STATS }, error: reason });
   }
 
   approve(id: string, allow: boolean, remember = false) {
@@ -707,6 +829,7 @@ export class LinkSession {
   }
 
   private closePeer(revoke = true) {
+    this.activeConnectionId = '';
     if (this.timer) clearInterval(this.timer);
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     if (this.authTimer) clearTimeout(this.authTimer);
@@ -744,6 +867,10 @@ export class LinkSession {
     this.closePeer();
     this.current.localStream?.getTracks().forEach((track) => track.stop());
     window.inhouseDesktop?.captureEnded?.();
+    if (this.accountHosting) window.inhouseDesktop?.disableAccountHosting?.();
+    this.accountHosting = false;
+    this.cloudMode = false;
+    this.nativeCloudChallenge = '';
     this.processing = Promise.resolve();
     this.viewerInputEnabled = true;
     this.connectionNonce = '';
@@ -764,6 +891,7 @@ export class LinkSession {
 
   destroy() {
     window.removeEventListener('inhouse-account-changed', this.accountChanged);
+    this.removeHostingRevoked?.(); this.removePeerRevoked?.();
     this.destroyed = true;
     this.disconnect();
   }

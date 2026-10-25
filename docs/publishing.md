@@ -14,12 +14,12 @@ El ejecutable conserva los idiomas español e inglés y usa compresión máxima.
 
 GitHub Pages usa **GitHub Actions** como modo de despliegue. Las dos publicaciones lanzan explícitamente `deploy-static.yml` con `--ref main`; ese workflow obtiene los archivos públicos mediante checkout de `gh-pages` y configura el sitio existente para ese modo. La fuente del workflow se mantiene en `main`, sin copiarla a la rama de publicación. Actions necesita permisos de escritura de contenido para la rama de publicación y Releases. El workflow usa su `GITHUB_TOKEN` automático; no se añade un token personal al proyecto.
 
-Variables opcionales del repositorio:
+Configuración avanzada de compilaciones propias:
 
-- `VITE_SIGNALING_URL`: URL HTTPS del servicio Node/WebSocket desplegado. Si falta, se configura desde el cliente. Nunca contiene credenciales.
+- `VITE_SIGNALING_URL`: URL HTTPS de un servicio Node/WebSocket propio. Nunca contiene credenciales. La publicación oficial de Pages compila esta variable vacía para usar la conexión automática por cuenta; un usuario puede seleccionar su servicio opcional desde Ajustes.
 
 El script independiente `scripts/check-website.mjs` permite repetir la comprobación manualmente; acepta `PUBLIC_SITE_URL` y comprueba por defecto `https://miguelcoxcaballero.github.io/inhouse-games/`.
 
-GitHub Pages sirve producto, descargas, cliente y broker de login. **No ejecuta el servidor Node/WebSocket ni coturn.** El servicio de conexión se despliega aparte con los pasos de [deployment.md](deployment.md).
+GitHub Pages sirve producto, descargas, cliente y broker de login. **No ejecuta el servidor Node/WebSocket ni coturn.** El modo por cuenta utiliza señalización cifrada en el servicio público indicado en [deployment.md](deployment.md), sin activar un alojamiento propio. Node y coturn son opciones avanzadas.
 
 La creación de Releases verifica primero el SHA real de un tag Git inmutable y usa `--verify-tag`, sin pedir al token de Actions que cree una release para un commit ya desplazado de main. Las ejecuciones obsoletas sin tag se omiten. La web conserva las descargas estáticas comprobando los bytes de cada archivo en el commit exacto de `gh-pages`, sin inventar enlaces ni bloquear toda la página.

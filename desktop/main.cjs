@@ -1,11 +1,14 @@
 'use strict';
 
-const { app, BrowserWindow, desktopCapturer, dialog, ipcMain, screen, session, shell, Tray, Menu, nativeImage, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, desktopCapturer, dialog, ipcMain, screen, session, shell, Tray, Menu, nativeImage, powerSaveBlocker, safeStorage } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+const os = require('node:os');
 const { pathToFileURL } = require('node:url');
 const { validateInput } = require('./input-validation.cjs');
 const { createDesktopGoogleAuth } = require('./google-auth.cjs');
+const { createAccountHostingAuthority, createPeerRevocationHandler } = require('./account-hosting.cjs');
+const { createCloudAccountAuthority } = require('./cloud-account.cjs');
 const googleAuth = createDesktopGoogleAuth({ publicAppUrl: process.env.INHOUSE_PUBLIC_APP_URL || process.env.VITE_PUBLIC_APP_URL });
 
 let window;
@@ -23,6 +26,43 @@ let inputBucket = Date.now();
 let exiting = false;
 let tray;
 let wakeLock = null;
+let accountHosting;
+let googleOwnerVerifier;
+let googleLoginEpoch = 0;
+let controlFromAccount = false;
+let cloudAccount;
+let accountHostingMode = null;
+
+function nativeAccountAuthority() { return accountHostingMode === 'cloud' ? cloudAccount : accountHosting; }
+
+function nativeProtectedStorageAvailable() {
+  try {
+    return safeStorage.isEncryptionAvailable()
+      && !(process.platform === 'linux' && safeStorage.getSelectedStorageBackend?.() === 'basic_text');
+  } catch { return false; }
+}
+
+function notifyNative(name, reason) {
+  if (window && !window.isDestroyed()) window.webContents.send(name, reason);
+}
+
+function stopAccountHosting(reason = '') {
+  accountHosting?.disable(reason);
+  cloudAccount?.disable(reason);
+  accountHostingMode = null;
+  setSharingAwake(false);
+  disableControl();
+  captureBounds = null;
+  captureDisplayId = null;
+}
+
+async function nativeGoogleOwner(accessToken) {
+  if (!googleOwnerVerifier) {
+    const { createGoogleTokenVerifier, DEFAULT_GOOGLE_CLIENT_ID } = await import(pathToFileURL(path.join(__dirname, '..', 'server', 'google-auth.mjs')).href);
+    googleOwnerVerifier = createGoogleTokenVerifier({ clientId: process.env.GOOGLE_CLIENT_ID || DEFAULT_GOOGLE_CLIENT_ID });
+  }
+  return googleOwnerVerifier(accessToken);
+}
 
 function setSharingAwake(active) {
   if (active && wakeLock === null) wakeLock = powerSaveBlocker.start('prevent-display-sleep');
@@ -76,6 +116,7 @@ function releaseInputs() {
 function disableControl() {
   controlEpoch += 1;
   controlEnabled = false;
+  controlFromAccount = false;
   releaseInputs();
 }
 
@@ -157,6 +198,7 @@ function updateCaptureBounds() {
   if (!captureDisplayId) return;
   const nextBounds = selectedDisplayBounds(captureDisplayId);
   if (!nextBounds) {
+    nativeAccountAuthority()?.disable('La pantalla compartida ya no está disponible.');
     setSharingAwake(false);
     disableControl();
     captureDisplayId = null;
@@ -165,6 +207,36 @@ function updateCaptureBounds() {
   }
   captureBounds = nextBounds;
   if (controlEnabled && !writeNative({ kind: 'bounds', ...nextBounds })) disableControl();
+}
+
+async function accountCaptureSource() {
+  const authority = nativeAccountAuthority();
+  if (!authority?.canCapture()) return null;
+  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 90 } });
+  if (authority !== nativeAccountAuthority() || !authority.canCapture()) return null;
+  const primary = screen.getPrimaryDisplay();
+  const source = sources.find((candidate) => String(candidate.display_id) === String(primary.id));
+  if (!source) return null;
+  const bounds = selectedDisplayBounds(source.display_id);
+  if (!bounds) return null;
+  disableControl();
+  captureDisplayId = String(source.display_id);
+  captureBounds = bounds;
+  setSharingAwake(true);
+  return source;
+}
+
+async function enableOwnAccountControl() {
+  const authority = nativeAccountAuthority();
+  if (process.platform !== 'win32' || !captureBounds || !authority?.canControl()) return false;
+  const epoch = controlEpoch;
+  const bounds = captureBounds;
+  await startNative();
+  if (epoch !== controlEpoch || captureBounds !== bounds || authority !== nativeAccountAuthority() || !authority.canControl()) return false;
+  if (!writeNative({ kind: 'bounds', ...bounds })) return false;
+  controlEnabled = true;
+  controlFromAccount = true;
+  return true;
 }
 
 function registerCapture() {
@@ -184,6 +256,13 @@ function registerCapture() {
     try {
       if (!window || request.frame !== window.webContents.mainFrame || new URL(request.frame.url).origin !== appOrigin) {
         callback({});
+        return;
+      }
+      if (nativeAccountAuthority()?.canCapture()) {
+        const ownSource = await accountCaptureSource();
+        if (!ownSource) { callback({}); return; }
+        if (process.platform === 'win32' && request.audioRequested) callback({ video: ownSource, audio: 'loopback' });
+        else callback({ video: ownSource });
         return;
       }
       const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 90 } });
@@ -215,8 +294,71 @@ function registerCapture() {
 }
 
 function registerIpc() {
-  ipcMain.handle('inhouse:google-sign-in', async (event) => {
+  ipcMain.handle('inhouse:computer-name', (event) => {
+    if (!trustedSender(event)) throw new Error('No se permite consultar este equipo desde esa página.');
+    return os.hostname().replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) || 'PC Windows';
+  });
+  ipcMain.handle('inhouse:account-hosting', async (event, credential) => {
+    if (!trustedSender(event) || process.platform !== 'win32') return false;
+    stopAccountHosting();
+    const allowed = await accountHosting.enable(credential);
+    if (!trustedSender(event)) { stopAccountHosting(); return false; }
+    if (allowed) accountHostingMode = 'backend';
+    return allowed;
+  });
+  ipcMain.handle('inhouse:cloud-account-restore', async (event) => {
+    if (!trustedSender(event)) return null;
+    const restored = await cloudAccount.restore();
+    return trustedSender(event) ? restored : null;
+  });
+  ipcMain.on('inhouse:cloud-account-forget', (event) => {
+    if (!trustedSender(event)) return;
+    stopAccountHosting();
+    void cloudAccount.forget().catch(() => {});
+  });
+  ipcMain.handle('inhouse:cloud-account-hosting', async (event, identity) => {
+    if (!trustedSender(event) || process.platform !== 'win32') return null;
+    stopAccountHosting();
+    const enabled = await cloudAccount.enable(identity);
+    if (!trustedSender(event)) { stopAccountHosting(); return null; }
+    if (enabled) accountHostingMode = 'cloud';
+    return enabled;
+  });
+  ipcMain.handle('inhouse:account-capture-source', async (event) => {
+    if (!trustedSender(event) || process.platform !== 'win32') return null;
+    const source = await accountCaptureSource();
+    if (!trustedSender(event)) { stopAccountHosting(); return null; }
+    return source ? { sourceId: source.id } : null;
+  });
+  ipcMain.handle('inhouse:account-peer', async (event, connectionId) => {
+    if (!trustedSender(event) || process.platform !== 'win32') return false;
+    if (!await accountHosting.authorizePeer(connectionId) || !trustedSender(event)) return false;
+    try { return await enableOwnAccountControl(); }
+    catch { accountHosting.endPeer('No se ha podido iniciar el control de Windows.'); return false; }
+  });
+  ipcMain.handle('inhouse:cloud-account-peer', async (event, proof) => {
+    if (!trustedSender(event) || process.platform !== 'win32' || accountHostingMode !== 'cloud') return false;
+    if (!await cloudAccount.authorizePeer(proof) || !trustedSender(event)) return false;
+    try { return await enableOwnAccountControl(); }
+    catch { cloudAccount.endPeer('No se ha podido iniciar el control de Windows.'); return false; }
+  });
+  ipcMain.handle('inhouse:cloud-account-peer-renew', async (event, proof) => {
+    if (!trustedSender(event) || process.platform !== 'win32' || accountHostingMode !== 'cloud') return false;
+    return cloudAccount.renewPeer(proof);
+  });
+  ipcMain.on('inhouse:account-peer-ended', (event) => {
+    if (!trustedSender(event)) return;
+    accountHosting.endPeer();
+    cloudAccount.endPeer();
+    disableControl();
+  });
+  ipcMain.on('inhouse:account-hosting-disabled', (event) => { if (trustedSender(event)) stopAccountHosting(); });
+  ipcMain.handle('inhouse:google-sign-in', async (event, options) => {
     if (!trustedSender(event)) throw new Error('No se permite iniciar el acceso desde esta página.');
+    const loginEpoch = ++googleLoginEpoch;
+    accountHosting.pauseForLogin();
+    cloudAccount.beginLogin();
+    stopAccountHosting();
     const attempt = googleAuth.begin();
     // A canceled request can settle while the OS is still opening the browser.
     // Keep that rejection handled without changing the promise delivered to IPC.
@@ -224,16 +366,33 @@ function registerIpc() {
     try {
       await shell.openExternal(attempt.url);
       const result = await attempt.promise;
-      if (!trustedSender(event)) throw new Error('La ventana que inició el acceso ya no está disponible.');
+      if (!trustedSender(event) || loginEpoch !== googleLoginEpoch) throw new Error('La ventana que inició el acceso ya no está disponible.');
+      const owner = await nativeGoogleOwner(result.accessToken);
+      if (!trustedSender(event) || loginEpoch !== googleLoginEpoch) throw new Error('La solicitud de acceso ya no está activa.');
+      await accountHosting.recordGoogleOwner(owner);
+      if (!trustedSender(event) || loginEpoch !== googleLoginEpoch) throw new Error('La solicitud de acceso ya no está activa.');
+      let cloud = null;
+      if (options?.cloudMode === true) {
+        const { obtainDriveRealm } = await import(pathToFileURL(path.join(__dirname, '..', 'server', 'drive-realm.mjs')).href);
+        const realm = await obtainDriveRealm(result.accessToken, owner);
+        if (!trustedSender(event) || loginEpoch !== googleLoginEpoch) throw new Error('La solicitud de acceso ya no está activa.');
+        cloud = await cloudAccount.recordSession(realm, owner);
+        if (!cloud || !trustedSender(event) || loginEpoch !== googleLoginEpoch) throw new Error('La solicitud de acceso ya no está activa.');
+      }
       if (window) { window.show(); if (window.isMinimized()) window.restore(); window.focus(); }
-      return result;
+      return cloud ? { ...result, cloudRealm: cloud.realm, profile: cloud.profile, cloudSessionExpiresAt: cloud.expiresAt } : result;
     } catch (error) {
       attempt.cancel();
       throw new Error(error instanceof Error ? error.message : 'No se ha podido completar el acceso con Google.');
     }
   });
   ipcMain.on('inhouse:google-sign-out', (event) => {
-    if (trustedSender(event)) googleAuth.cancel();
+    if (!trustedSender(event)) return;
+    googleLoginEpoch++;
+    googleAuth.cancel();
+    stopAccountHosting();
+    void accountHosting.signOut().catch(() => {});
+    void cloudAccount.forget().catch(() => {});
   });
   ipcMain.on('inhouse:minimize-host', (event) => {
     if (trustedSender(event) && captureBounds && window) window.minimize();
@@ -243,6 +402,9 @@ function registerIpc() {
     if (enabled !== true) { disableControl(); return false; }
     if (process.platform !== 'win32' || !captureBounds || controlPrompt) return false;
     if (controlEnabled) return true;
+    if (nativeAccountAuthority()?.canControl()) {
+      try { return await enableOwnAccountControl(); } catch { return false; }
+    }
     controlPrompt = true;
     const requestedEpoch = controlEpoch;
     const requestedBounds = captureBounds;
@@ -271,6 +433,7 @@ function registerIpc() {
   });
   ipcMain.on('inhouse:input', (event, data) => {
     if (!trustedSender(event) || !controlEnabled || !captureBounds) return;
+    if (controlFromAccount && !nativeAccountAuthority()?.canControl()) { disableControl(); return; }
     const validated = validateInput(data);
     if (!validated) return;
     if (validated.kind === 'release') { releaseInputs(); return; }
@@ -281,10 +444,7 @@ function registerIpc() {
   ipcMain.on('inhouse:release', (event) => { if (trustedSender(event)) releaseInputs(); });
   ipcMain.on('inhouse:capture-ended', (event) => {
     if (!trustedSender(event)) return;
-    setSharingAwake(false);
-    disableControl();
-    captureBounds = null;
-    captureDisplayId = null;
+    stopAccountHosting();
   });
 }
 
@@ -298,12 +458,12 @@ function configureNavigation() {
     event.preventDefault();
   });
   window.webContents.on('will-attach-webview', (event) => event.preventDefault());
-  window.webContents.on('render-process-gone', () => { googleAuth.cancel(); setSharingAwake(false); captureBounds = null; captureDisplayId = null; stopNative(); });
+  window.webContents.on('render-process-gone', () => { googleLoginEpoch++; googleAuth.cancel(); stopAccountHosting(); stopNative(); });
   window.webContents.on('did-start-navigation', (_event, _url, _inPlace, isMainFrame) => {
-    if (isMainFrame) { googleAuth.cancel(); setSharingAwake(false); captureBounds = null; captureDisplayId = null; disableControl(); }
+    if (isMainFrame) { googleLoginEpoch++; googleAuth.cancel(); stopAccountHosting(); }
   });
   window.on('blur', releaseInputs);
-  window.on('closed', () => { googleAuth.cancel(); setSharingAwake(false); captureBounds = null; captureDisplayId = null; stopNative(); window = null; });
+  window.on('closed', () => { googleLoginEpoch++; googleAuth.cancel(); stopAccountHosting(); stopNative(); window = null; });
 }
 
 async function createWindow() {
@@ -350,6 +510,7 @@ async function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      backgroundThrottling: false,
       spellcheck: false,
     },
   });
@@ -364,6 +525,28 @@ else {
     if (window) { if (window.isMinimized()) window.restore(); window.focus(); }
   });
   app.whenReady().then(async () => {
+    accountHosting = createAccountHostingAuthority({
+      file: path.join(app.getPath('userData'), 'native-account-hosting.json'),
+      onPeerRevoked: createPeerRevocationHandler(disableControl, (reason) => notifyNative('inhouse:account-peer-revoked', reason)),
+      onHostingRevoked: (reason) => {
+        setSharingAwake(false);
+        disableControl();
+        captureBounds = null;
+        captureDisplayId = null;
+        notifyNative('inhouse:account-hosting-revoked', reason);
+      },
+    });
+    cloudAccount = createCloudAccountAuthority({
+      file: path.join(app.getPath('userData'), 'native-cloud-account.bin'),
+      protect: (value) => safeStorage.encryptString(value),
+      unprotect: (value) => safeStorage.decryptString(value),
+      isProtectionAvailable: nativeProtectedStorageAvailable,
+      onPeerRevoked: createPeerRevocationHandler(disableControl, (reason) => notifyNative('inhouse:account-peer-revoked', reason)),
+      onHostingRevoked: (reason) => {
+        setSharingAwake(false); disableControl(); captureBounds = null; captureDisplayId = null;
+        notifyNative('inhouse:account-hosting-revoked', reason);
+      },
+    });
     registerIpc();
     screen.on('display-metrics-changed', updateCaptureBounds);
     screen.on('display-added', updateCaptureBounds);
@@ -376,14 +559,16 @@ else {
   });
   app.on('window-all-closed', () => app.quit());
   app.on('before-quit', (event) => {
+    googleLoginEpoch++;
     googleAuth.cancel();
+    stopAccountHosting();
     setSharingAwake(false);
     if (tray) { tray.destroy(); tray = null; }
     stopNative();
     if (localServer && !exiting) {
       event.preventDefault();
       exiting = true;
-      Promise.resolve(localServer.close()).finally(() => app.quit());
+      Promise.allSettled([localServer.close(), accountHosting?.flush(), cloudAccount?.flush()]).finally(() => app.quit());
     }
   });
 }

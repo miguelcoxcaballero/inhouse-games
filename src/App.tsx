@@ -7,6 +7,9 @@ import {
 } from 'lucide-react';
 import { DEFAULT_SETTINGS, forgetTrustedHost, getTrustedDevices, getTrustedHosts, LinkSession, type LinkSettings, type LinkState, type SessionStats } from './lib/session';
 import { attachRemoteInput } from './lib/input';
+import { AccountDevices, EMPTY_DEVICES, type DevicesState } from './lib/devices';
+import { getConfiguredServiceOrigin } from './lib/google-account';
+import { useCloudAccountTransport } from './lib/service-config';
 import AccountMenu, { type AccountProfile } from './components/AccountMenu';
 import './styles.css';
 
@@ -18,6 +21,9 @@ type DesktopBridge = {
   setControlEnabled(enabled: boolean): Promise<boolean>;
   releaseInputs(): void;
   minimizeHost?(): void;
+  enableAccountHosting?: NonNullable<Window['inhouseDesktop']>['enableAccountHosting'];
+  enableCloudAccountHosting?: NonNullable<Window['inhouseDesktop']>['enableCloudAccountHosting'];
+  getComputerName?: NonNullable<Window['inhouseDesktop']>['getComputerName'];
 };
 const desktop = (window as unknown as { inhouseDesktop?: DesktopBridge }).inhouseDesktop;
 const WINDOWS_DOWNLOAD = `${import.meta.env.BASE_URL}downloads/Inhouse-Link-Windows.exe`;
@@ -134,6 +140,11 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
   const [shortcuts, setShortcuts] = useState(readShortcuts);
   const [trustedHosts, setTrustedHosts] = useState(getTrustedHosts);
   const [trustedCount, setTrustedCount] = useState(() => getTrustedDevices().length);
+  const [devices, setDevices] = useState<DevicesState>({ ...EMPTY_DEVICES });
+  const [accountHosting, setAccountHosting] = useState(() => {
+    try { return localStorage.getItem(`inhouse.link.account-hosting:${profile?.id || ''}`) !== 'false'; } catch { return true; }
+  });
+  const [localDeviceId, setLocalDeviceId] = useState('');
   const [pointerLocked, setPointerLocked] = useState(false);
   const [configRevision, setConfigRevision] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -150,6 +161,8 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
   const inSession = state.status === 'connected' && !!(state.remoteStream || state.localStream);
   const busy = ['connecting', 'pending', 'negotiating'].includes(state.status);
   const resolvedWindowsDownload = windowsDownload === undefined ? (downloadAvailable ? WINDOWS_DOWNLOAD : null) : windowsDownload?.url || null;
+  const cloudAccountMode = useCloudAccountTransport();
+  const supportsAutomaticHosting = !!(desktop?.enableAccountHosting || desktop?.enableCloudAccountHosting);
 
   useEffect(() => { if (inSession) diagnosticSamples.current = []; }, [inSession]);
   useEffect(() => {
@@ -157,25 +170,54 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
   }, [inSession, state.stats]);
 
   useEffect(() => {
-    const session = new LinkSession(setState);
+    const session = new LinkSession(next => {
+      setState(next);
+      if (next.role === 'host' && next.deviceId) setLocalDeviceId(next.deviceId);
+    });
     sessionRef.current = session;
     setState(session.state);
     return () => { session.destroy(); sessionRef.current = null; };
   }, []);
 
   useEffect(() => {
+    const directory = new AccountDevices(setDevices);
+    directory.start();
+    return () => directory.stop();
+  }, [profile?.id, activeServer, configRevision]);
+
+  useEffect(() => {
+    try { localStorage.setItem(`inhouse.link.account-hosting:${profile?.id || ''}`, String(accountHosting)); } catch { /* Preference remains active in memory. */ }
+  }, [accountHosting, profile?.id]);
+
+  useEffect(() => {
+    if (!supportsAutomaticHosting || !accountHosting || devices.status !== 'online') return;
+    const session = sessionRef.current;
+    if (!session || session.state.role === 'viewer' || !['idle', 'disconnected'].includes(session.state.status)) return;
     let cancelled = false;
-    const serviceBase = activeServer || import.meta.env.VITE_SIGNALING_URL || location.origin;
+    void (async () => {
+      const computerName = await desktop.getComputerName?.().catch(() => 'PC Windows') || 'PC Windows';
+      if (!cancelled && session === sessionRef.current && session.state.role !== 'viewer') {
+        await session.host(settings, { accountHosting: true, name: computerName });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [accountHosting, devices.status, profile?.id, configRevision, state.status, state.role]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const serviceBase = getConfiguredServiceOrigin();
     const checkHealth = async () => {
+      if (cloudAccountMode) { if (!cancelled) setServerReady(devices.status === 'online'); return; }
+      if (!serviceBase) { if (!cancelled) setServerReady(false); return; }
       const healthUrl = new URL('/health', serviceBase).toString();
-      const response = await fetch(healthUrl);
+      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(8000) });
       const healthy = response.ok && response.headers.get('content-type')?.includes('application/json') && (await response.json()).ok === true;
       if (!cancelled) setServerReady(!!healthy);
     };
     void checkHealth().catch(() => { if (!cancelled) setServerReady(false); });
     if (windowsDownload === undefined) fetch(WINDOWS_DOWNLOAD, { method: 'HEAD' }).then(response => { if (!cancelled) setDownloadAvailable(response.ok && !response.headers.get('content-type')?.includes('text/html')); }).catch(() => {});
     return () => { cancelled = true; };
-  }, [activeServer, configRevision, windowsDownload]);
+  }, [activeServer, configRevision, windowsDownload, cloudAccountMode, devices.status]);
 
   useEffect(() => {
     setTrustedHosts(getTrustedHosts()); setTrustedCount(getTrustedDevices().length);
@@ -235,7 +277,10 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
   }, [modal, state.requests.length]);
 
   const disconnect = useCallback(() => {
-    sessionRef.current?.disconnect(); setMenuOpen(false); setStatsOpen(false); setInputEnabled(true);
+    const session = sessionRef.current;
+    if (session?.state.role === 'host' && session.state.accountHosting) session.disconnectPeer();
+    else session?.disconnect();
+    setMenuOpen(false); setStatsOpen(false); setInputEnabled(true);
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
   }, []);
 
@@ -321,7 +366,17 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
 
   const host = async () => {
     if (!desktop) { setModal('download'); return; }
-    await sessionRef.current?.host(settings).catch(error => notify(error instanceof Error ? error.message : 'No se ha podido compartir la pantalla.'));
+    if (supportsAutomaticHosting) {
+      setAccountHosting(true);
+      const computerName = await desktop.getComputerName?.().catch(() => 'PC Windows') || 'PC Windows';
+      await sessionRef.current?.host(settings, { accountHosting: true, name: computerName });
+    } else await sessionRef.current?.host(settings).catch(error => notify(error instanceof Error ? error.message : 'No se ha podido compartir la pantalla.'));
+  };
+
+  const stopHosting = () => { setAccountHosting(false); sessionRef.current?.disconnect(); };
+
+  const connectDevice = async (deviceId: string) => {
+    await sessionRef.current?.join(deviceId, settings, name.trim() || profile?.name || 'Mi equipo');
   };
 
   const copyCode = async () => {
@@ -331,7 +386,7 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
 
   const exportDiagnostic = () => {
     if (!diagnosticSamples.current.length) { notify('Espera a recibir las primeras estadísticas de la sesión.'); return; }
-    const contents = { version: desktop?.version || '0.1.0', createdAt: new Date().toISOString(), samples: diagnosticSamples.current };
+    const contents = { version: desktop?.version || '0.3.0', createdAt: new Date().toISOString(), samples: diagnosticSamples.current };
     const url = URL.createObjectURL(new Blob([JSON.stringify(contents, null, 2)], { type: 'application/json' }));
     const anchor = document.createElement('a'); anchor.href = url; anchor.download = `inhouse-link-diagnostico-${Date.now()}.json`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     notify('Diagnóstico exportado sin códigos, claves ni nombres de equipos.');
@@ -398,15 +453,29 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
             </div>
           </section>
 
-          <section className="connection-cards" aria-label="Conectar y compartir">
+          <section className="account-computers" aria-label="Equipos de tu cuenta" data-testid="account-device-list">
+            <div className="account-computers-heading">
+              <div><span className="eyebrow">TU CUENTA. TUS EQUIPOS.</span><h2>Siempre a mano<span className="accent-text">.</span></h2><p>Elige un PC en línea y entra directamente con tu cuenta de Google.</p></div>
+              <span className="account-online-count"><span className={`tiny-dot ${devices.status === 'online' ? 'is-live' : ''}`} />{devices.status === 'loading' ? 'Buscando equipos…' : `${devices.devices.filter(device => device.deviceId !== localDeviceId).length} en línea`}</span>
+            </div>
+            {(devices.status === 'unconfigured' || devices.localOnly) && <div className="account-service-notice" data-testid="account-service-required"><Globe2 size={22} /><div><strong>{devices.localOnly ? 'Este PC está usando su servicio local.' : 'Activa la conexión entre tus equipos.'}</strong><p>Todos tus equipos necesitan el mismo servicio para encontrarse. Una vez activado, aparecerán aquí con tu cuenta.</p><a className="text-button" href="https://render.com/deploy?repo=https://github.com/miguelcoxcaballero/inhouse-games" target="_blank" rel="noopener noreferrer">Activar servicio<ArrowUpRight size={14} /></a><button className="text-button" onClick={() => setTab('settings')}>Usar mi servicio<ArrowRight size={14} /></button></div></div>}
+            {devices.status === 'offline' && <div className="account-service-notice" role="status"><Wifi size={22} /><div><strong>Reconectando con tus equipos</strong><p>{devices.error}</p></div></div>}
+            <div className="account-device-grid">
+              {desktop && <article className="account-device-card account-local-device"><span className="account-device-icon"><Monitor size={25} /></span><span className="eyebrow">ESTE PC</span><h3>Disponible para ti</h3><p>Los dispositivos de tu cuenta pueden entrar sin códigos ni solicitudes.</p>{supportsAutomaticHosting ? <label className="account-host-switch"><input type="checkbox" data-testid="account-host-toggle" checked={accountHosting} onChange={event => { const enabled = event.target.checked; setAccountHosting(enabled); if (!enabled && sessionRef.current?.state.role === 'host') sessionRef.current.disconnect(); else if (enabled && sessionRef.current?.state.status === 'error') sessionRef.current.disconnect(); }} /><span>{accountHosting ? 'Disponibilidad automática activada' : 'Acceso a este PC desactivado'}</span></label> : <span className="account-device-meta">Actualiza Windows para activar la disponibilidad automática.</span>}<span className="account-device-meta">{state.accountHosting ? state.status === 'hosting' ? 'En línea · esperando conexión' : statusLabels[state.status] : 'Inicia sesión y mantén la aplicación abierta'}</span></article>}
+              {devices.devices.filter(device => device.deviceId !== localDeviceId).map(device => <article className="account-device-card" data-testid={`account-device-card-${device.deviceId}`} key={device.deviceId}><span className="account-device-icon"><Monitor size={25} /><span className="tiny-dot is-live" /></span><span className="eyebrow">{device.busy ? 'EN USO' : 'EN LÍNEA'}</span><h3>{device.name}</h3><p>Vinculado a tu cuenta de Google.</p><button className="button button-primary" data-testid={`account-device-connect-${device.deviceId}`} disabled={busy || device.busy} onClick={() => void connectDevice(device.deviceId)}>{device.busy ? 'Equipo ocupado' : 'Conectar'}<ArrowRight size={17} /></button><span className="account-device-meta">Acceso directo · sin aceptación en el PC</span></article>)}
+            </div>
+            {devices.status === 'online' && devices.devices.filter(device => device.deviceId !== localDeviceId).length === 0 && <p className="account-empty-devices" data-testid="account-devices-empty">Todavía no hay otros equipos en línea. Abre Inhouse Link en tu PC Windows e inicia sesión con esta misma cuenta.</p>}
+          </section>
+
+          {!cloudAccountMode && <section className="connection-cards" aria-label="Conectar y compartir">
             <article className="connect-card primary-card">
               <div className="card-heading"><span className="card-icon"><Link2 size={21} /></span><span className="step-number">01 / CONECTAR</span><span className="card-corner-icon"><ArrowUpRight size={20} /></span></div>
-              <h2>Entra en tu equipo.</h2><p>Introduce el código que aparece en el PC que quieres utilizar.</p>
+              <h2>Conectar con invitación.</h2><p>Para acceder a un equipo de otra cuenta, introduce su código. Tus propios equipos aparecen arriba.</p>
               <form onSubmit={connect}>
                 <label className="sr-only" htmlFor="connection-code">Código de conexión</label>
-                <div className={`code-input-wrap ${busy ? 'is-busy' : ''}`}><Keyboard size={19} /><input ref={codeRef} id="connection-code" data-testid="join-code" aria-label="Código de conexión" type="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="XXXX · XXXX" maxLength={20} value={code} disabled={busy || state.status === 'hosting'} onChange={event => setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9 -]/g, ''))} /><span className="input-key">CÓDIGO</span></div>
+                <div className={`code-input-wrap ${busy ? 'is-busy' : ''}`}><Keyboard size={19} /><input ref={codeRef} id="connection-code" data-testid="join-code" aria-label="Código de conexión" type="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} placeholder="XXXX · XXXX" maxLength={20} value={code} disabled={busy} onChange={event => setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9 -]/g, ''))} /><span className="input-key">CÓDIGO</span></div>
                 <div className="name-input-row"><label htmlFor="viewer-name">Tu nombre</label><input id="viewer-name" data-testid="join-name" placeholder="Mi portátil" value={name} maxLength={40} onChange={event => setName(event.target.value)} disabled={busy} /></div>
-                <button className="button button-primary connect-button" data-testid="connect-button" type="submit" disabled={busy || state.status === 'hosting' || !code.replace(/[^A-Z0-9]/g, '')}>{busy ? <><LoaderCircle size={18} className="spin" />{statusLabels[state.status]}</> : <>Conectar al equipo<ArrowRight size={18} /></>}</button>
+                <button className="button button-primary connect-button" data-testid="connect-button" type="submit" disabled={busy || !code.replace(/[^A-Z0-9]/g, '')}>{busy ? <><LoaderCircle size={18} className="spin" />{statusLabels[state.status]}</> : <>Conectar al equipo<ArrowRight size={18} /></>}</button>
               </form>
               <div className="card-footnote"><LockKeyhole size={13} />Tú decides qué dispositivos pueden entrar.</div>
             </article>
@@ -414,28 +483,28 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
             <article className="connect-card host-card">
               <div className="card-heading"><span className="card-icon subdued"><Monitor size={21} /></span><span className="step-number">02 / COMPARTIR</span><span className="card-corner-icon"><Radio size={19} /></span></div>
               <h2>Deja tu PC a mano.</h2><p>Abre Inhouse Link en tu PC Windows y comparte tu pantalla de forma segura.</p>
-              {state.status === 'hosting' || (state.role === 'host' && busy) ? <div className="hosting-code"><span className="status-label"><span className="status-dot pulse" />{statusLabels[state.status]}</span><div><strong data-testid="host-code">{state.code || '···· ····'}</strong><button className="icon-button" onClick={copyCode} aria-label="Copiar código">{copied ? <Check size={18} /> : <Copy size={18} />}</button></div><span>Compártelo solo con la persona que quieres conectar.</span><button className="text-button" onClick={disconnect}>Dejar de compartir</button></div> : <>
-                <div className="host-feature-list"><span><Check size={15} />Tú apruebas quién entra</span><span><Check size={15} />Vídeo y audio del equipo</span><span><Check size={15} />Revoca el control cuando quieras</span></div>
+              {state.status === 'hosting' || (state.role === 'host' && busy) ? <div className="hosting-code"><span className="status-label"><span className="status-dot pulse" />{statusLabels[state.status]}</span><div><strong data-testid="host-code">{state.code || '···· ····'}</strong><button className="icon-button" onClick={copyCode} aria-label="Copiar código">{copied ? <Check size={18} /> : <Copy size={18} />}</button></div><span>Tu cuenta conecta directamente. Este código permite invitar a otras cuentas.</span><button className="text-button" onClick={stopHosting}>Dejar de compartir</button></div> : <>
+                <div className="host-feature-list"><span><Check size={15} />Tu cuenta entra directamente</span><span><Check size={15} />Vídeo y audio del equipo</span><span><Check size={15} />Desactiva el acceso cuando quieras</span></div>
                 <button className="button button-secondary" data-testid="host-button" onClick={host} disabled={busy}>{desktop ? <><Radio size={17} />Compartir este PC</> : <><ArrowDownToLine size={17} />Obtener la app de Windows</>}<ArrowUpRight size={17} /></button>
               </>}
               <div className="card-footnote"><Monitor size={13} />{desktop ? 'La captura requiere tu permiso.' : 'El navegador funciona como cliente. La app comparte el PC.'}</div>
             </article>
-          </section>
+          </section>}
 
-          {state.status !== 'idle' && state.status !== 'hosting' && !inSession && <div className={`connection-feedback ${state.status === 'error' ? 'feedback-error' : ''}`} role="status"><span>{busy ? <LoaderCircle size={18} className="spin" /> : state.status === 'error' ? <X size={18} /> : <Signal size={18} />}</span><div><strong>{statusLabels[state.status]}</strong><p>{state.error || (state.status === 'pending' ? 'El PC remoto debe aceptar tu solicitud antes de compartir vídeo y controles.' : state.status === 'disconnected' ? 'Puedes iniciar otra conexión cuando quieras.' : 'Estableciendo una conexión entre los dos equipos.')}</p></div>{busy && <button className="text-button" onClick={disconnect}>Cancelar</button>}</div>}
+          {state.status !== 'idle' && state.status !== 'hosting' && !inSession && <div className={`connection-feedback ${state.status === 'error' ? 'feedback-error' : ''}`} role="status"><span>{busy ? <LoaderCircle size={18} className="spin" /> : state.status === 'error' ? <X size={18} /> : <Signal size={18} />}</span><div><strong>{statusLabels[state.status]}</strong><p>{state.error || (state.status === 'pending' ? 'Esta invitación pertenece a otra cuenta. El anfitrión debe aceptarla.' : state.status === 'disconnected' ? 'Puedes iniciar otra conexión cuando quieras.' : 'Conectando con tu equipo…')}</p></div>{busy ? <button className="text-button" onClick={disconnect}>Cancelar</button> : state.status === 'error' && <button className="text-button" onClick={disconnect}>Volver a tus equipos</button>}</div>}
 
-          {trustedHosts.length > 0 && <section className="trusted-hosts" aria-label="Equipos vinculados"><div className="trusted-section-heading"><div><span className="eyebrow">SIEMPRE A MANO</span><h2>Tus equipos vinculados.</h2></div><span>{trustedHosts.length} {trustedHosts.length === 1 ? 'equipo' : 'equipos'}</span></div><div className="trusted-list">{trustedHosts.map(device => <article className="trusted-device" key={device.deviceId}><span className="trusted-device-icon"><Monitor size={22} /></span><div><strong>{device.name || 'PC vinculado'}</strong><span>El PC debe estar encendido y compartiendo.</span></div><button className="button button-secondary" disabled={busy || state.status === 'hosting'} onClick={() => { void sessionRef.current?.join(device.deviceId, settings, name.trim() || 'Mi portátil').catch(error => notify(error instanceof Error ? error.message : 'No se ha podido reconectar.')); }}>Conectar<ArrowRight size={15} /></button><button className="icon-button" aria-label={`Quitar ${device.name || 'PC vinculado'}`} onClick={() => { forgetTrustedHost(device.deviceId); setTrustedHosts(getTrustedHosts()); notify('Equipo eliminado de este dispositivo.'); }}><Trash2 size={16} /></button></article>)}</div></section>}
-          <section className="bottom-note"><div><span className="note-icon"><Globe2 size={20} /></span><p><strong>Tu conexión importa.</strong><span>Conecta ambos equipos al mismo servicio. Usar cable en el PC y una Wi-Fi estable en el portátil mejora la experiencia.</span></p></div><button onClick={() => setModal('how')} className="text-button">Cómo funciona<ArrowUpRight size={15} /></button></section>
+          {!cloudAccountMode && trustedHosts.length > 0 && <section className="trusted-hosts" aria-label="Equipos vinculados"><div className="trusted-section-heading"><div><span className="eyebrow">SIEMPRE A MANO</span><h2>Tus equipos vinculados.</h2></div><span>{trustedHosts.length} {trustedHosts.length === 1 ? 'equipo' : 'equipos'}</span></div><div className="trusted-list">{trustedHosts.map(device => <article className="trusted-device" key={device.deviceId}><span className="trusted-device-icon"><Monitor size={22} /></span><div><strong>{device.name || 'PC vinculado'}</strong><span>El PC debe estar encendido y compartiendo.</span></div><button className="button button-secondary" disabled={busy} onClick={() => { void sessionRef.current?.join(device.deviceId, settings, name.trim() || 'Mi portátil').catch(error => notify(error instanceof Error ? error.message : 'No se ha podido reconectar.')); }}>Conectar<ArrowRight size={15} /></button><button className="icon-button" aria-label={`Quitar ${device.name || 'PC vinculado'}`} onClick={() => { forgetTrustedHost(device.deviceId); setTrustedHosts(getTrustedHosts()); notify('Equipo eliminado de este dispositivo.'); }}><Trash2 size={16} /></button></article>)}</div></section>}
+          <section className="bottom-note"><div><span className="note-icon"><Globe2 size={20} /></span><p><strong>Tu conexión importa.</strong><span>Inicia sesión con la misma cuenta en tus equipos. Usar cable en el PC y una Wi-Fi estable en el portátil mejora la experiencia.</span></p></div><button onClick={() => setModal('how')} className="text-button">Cómo funciona<ArrowUpRight size={15} /></button></section>
         </> : <section className="settings-page">
           <div className="page-heading"><div className="eyebrow"><span className="eyebrow-line" />A TU MEDIDA</div><h1>La conexión,<br />a tu manera<span className="accent-text">.</span></h1><p>Un punto de partida para tu próxima sesión.<br />También puedes ajustar la calidad mientras juegas.</p></div>
           <div className="settings-card"><div className="settings-card-header"><span className="card-icon"><Settings2 size={22} /></span><div><h2>Vídeo y sonido</h2><p>Los ajustes se guardan en este dispositivo.</p></div></div><QualitySettings settings={settings} setSettings={setSettings} /><button className="text-button reset-button" onClick={() => { setSettings({ ...DEFAULT_SETTINGS }); notify('Ajustes restaurados.'); }}>Restaurar valores recomendados</button></div>
-          <section className="server-settings"><div className="settings-section-title"><Globe2 size={19} /><h3>Tu servicio de conexión.</h3></div><p>Ambos equipos deben utilizar el mismo servicio. En la app de Windows, configura su dirección pública HTTPS para conectar desde otra red.</p><form onSubmit={saveServer}><label className="field-label" htmlFor="signaling-url">Dirección del servicio<input data-testid="signaling-url" id="signaling-url" type="url" placeholder="https://link.tudominio.com" value={serverUrl} onChange={event => setServerUrl(event.target.value)} /></label><label className="field-label" htmlFor="service-token">Clave del servicio (si la requiere)<input data-testid="service-token" id="service-token" type="password" autoComplete="current-password" placeholder="Opcional" value={serviceToken} onChange={event => setServiceToken(event.target.value)} /></label><button className="button button-secondary" data-testid="save-settings" type="submit">Guardar servicio<Check size={15} /></button></form><span className="field-note">Vacío utiliza el servicio de esta página. HTTP solo se admite en localhost para desarrollo.</span></section>
+          <section className="server-settings"><div className="settings-section-title"><Globe2 size={19} /><h3>Conexión de la cuenta.</h3></div><p>La conexión automática usa tu cuenta de Google y no necesita configuración. Estos ajustes son opcionales para utilizar un servicio propio.</p><form onSubmit={saveServer}><label className="field-label" htmlFor="signaling-url">Dirección del servicio<input data-testid="signaling-url" id="signaling-url" type="url" placeholder="https://link.tudominio.com" value={serverUrl} onChange={event => setServerUrl(event.target.value)} /></label><label className="field-label" htmlFor="service-token">Clave del servicio (si la requiere)<input data-testid="service-token" id="service-token" type="password" autoComplete="current-password" placeholder="Opcional" value={serviceToken} onChange={event => setServiceToken(event.target.value)} /></label><button className="button button-secondary" data-testid="save-settings" type="submit">Guardar servicio<Check size={15} /></button></form><span className="field-note">Deja la dirección vacía para usar la conexión automática con tu cuenta. HTTP solo se admite en localhost para desarrollo.</span></section>
           <div className="keyboard-guide"><Keyboard size={20} /><div><h3>Atajos de inhouse link.</h3><p>Pulsa un campo y escribe la combinación que prefieras.</p>{(Object.keys(SHORTCUT_LABELS) as ShortcutAction[]).map(action => <div className="shortcut-setting" key={action}><label htmlFor={`shortcut-${action}`}>{SHORTCUT_LABELS[action]}</label><input id={`shortcut-${action}`} aria-label={`Atajo ${SHORTCUT_LABELS[action]}`} readOnly value={shortcutText(shortcuts[action])} onKeyDown={event => rememberShortcut(action, event)} onFocus={event => event.currentTarget.select()} /></div>)}<button className="text-button" onClick={() => setShortcuts({ ...DEFAULT_SHORTCUTS })}>Restaurar atajos</button><small>Ctrl + Shift + I activa la captura del ratón, como el modo inmersivo de Parsec. La captura de teclado está limitada por el navegador y Windows; no todos sus atajos se pueden reenviar.</small></div></div>
-          {desktop && <section className="trusted-settings"><div className="settings-section-title"><ShieldCheck size={19} /><h3>Dispositivos autorizados.</h3></div><p>{trustedCount === 0 ? 'Ningún dispositivo tiene permiso para reconectar sin autorización.' : `${trustedCount} ${trustedCount === 1 ? 'dispositivo puede' : 'dispositivos pueden'} reconectar a este PC cuando esté compartiendo.`}</p><button className="text-button revoke-button" disabled={trustedCount === 0} onClick={() => { sessionRef.current?.clearTrustedDevices(); setTrustedCount(0); notify('Permisos revocados. La próxima conexión necesitará autorización.'); }}><Trash2 size={14} />Revocar todos los dispositivos</button></section>}
+          {desktop && !cloudAccountMode && <section className="trusted-settings"><div className="settings-section-title"><ShieldCheck size={19} /><h3>Dispositivos autorizados.</h3></div><p>{trustedCount === 0 ? 'Ningún dispositivo tiene permiso para reconectar sin autorización.' : `${trustedCount} ${trustedCount === 1 ? 'dispositivo puede' : 'dispositivos pueden'} reconectar a este PC cuando esté compartiendo.`}</p><button className="text-button revoke-button" disabled={trustedCount === 0} onClick={() => { sessionRef.current?.clearTrustedDevices(); setTrustedCount(0); notify('Permisos revocados. La próxima conexión necesitará autorización.'); }}><Trash2 size={14} />Revocar todos los dispositivos</button></section>}
         </section>}
       </main>
 
-      <footer className="app-footer"><span>Hecho para estar cerca.</span><div><span className={`tiny-dot ${serverReady === true ? 'is-live' : serverReady === false ? 'is-offline' : ''}`} />{serverReady === null ? 'Comprobando servicio…' : serverReady ? 'Servicio de conexión disponible' : 'Servicio de conexión no disponible'}</div><span className="footer-version">inhouse link <span>·</span> {desktop?.version || 'WEB'}</span></footer>
+      <footer className="app-footer"><span>Hecho para estar cerca.</span><div><span className={`tiny-dot ${serverReady === true ? 'is-live' : serverReady === false ? 'is-offline' : ''}`} />{cloudAccountMode ? (serverReady ? 'Equipos sincronizados con tu cuenta' : 'Sincronizando tus equipos…') : serverReady === null ? 'Comprobando servicio…' : serverReady ? 'Servicio de conexión disponible' : 'Servicio de conexión no disponible'}</div><span className="footer-version">inhouse link <span>·</span> {desktop?.version || 'WEB'}</span></footer>
     </>}
 
     {inSession && <div ref={stageRef} className="session-stage" data-testid="session-stage">
@@ -449,7 +518,7 @@ export default function App({ profile, onSignOut, onSwitchAccount, onHome, windo
 
     {state.requests.length > 0 && <div className="modal-backdrop"><section className="dialog approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title"><span className="dialog-hero-icon"><ShieldCheck size={30} /></span><span className="eyebrow">TÚ TIENES EL CONTROL</span><h2 id="approval-title">Una nueva conexión.</h2><p><strong>{state.requests[0].name || 'Un dispositivo'}</strong> quiere ver tu pantalla y controlar este PC. Acepta solo si reconoces esta solicitud.</p><div className="approval-detail"><Monitor size={18} /><span>Compartirás vídeo, audio si está disponible y, en Windows, teclado y ratón.</span></div><button className="button button-primary" onClick={() => sessionRef.current?.approve(state.requests[0].id, true, false)} data-testid="approve-once"><Check size={18} />Permitir esta vez</button><button className="button button-secondary approve-trust-button" onClick={() => sessionRef.current?.approve(state.requests[0].id, true, true)} data-testid="approve-trust"><ShieldCheck size={18} />Permitir y vincular</button><p className="approval-remember-note">Al vincular, este portátil podrá reconectar sin otra aprobación mientras el PC siga compartiendo. Puedes revocar el permiso en Ajustes.</p><button className="button button-ghost" data-testid="reject-request" onClick={() => sessionRef.current?.approve(state.requests[0].id, false)}>Rechazar conexión</button></section></div>}
 
-    {modal && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget) setModal(null); }}><section className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button className="icon-button dialog-close" aria-label="Cerrar ventana" onClick={() => setModal(null)}><X size={20} /></button>{modal === 'download' ? <><span className="dialog-hero-icon"><Monitor size={30} /></span><span className="eyebrow">EL PC SE QUEDA. TÚ TE MUEVES.</span><h2 id="dialog-title">Todo empieza<br />en tu PC Windows.</h2><p>La aplicación de Inhouse Link comparte tu pantalla y permite el control remoto. Después podrás entrar desde este navegador o desde otro Windows.</p><ol className="setup-steps"><li><span>1</span>Abre la app en el PC que tiene tus juegos.</li><li><span>2</span>Pulsa «Compartir este PC» y copia el código.</li><li><span>3</span>Conecta desde tu portátil y autoriza la solicitud.</li></ol>{resolvedWindowsDownload ? <a className="button button-primary" href={resolvedWindowsDownload} download><ArrowDownToLine size={18} />Descargar para Windows<ArrowUpRight size={17} /></a> : <div className="download-notice"><ArrowDownToLine size={18} /><span>El ejecutable Windows todavía no está disponible en este servidor. Necesitas la compilación de la app para compartir el PC.</span></div>}<p className="dialog-fineprint">Compartir pantalla desde el navegador no permite controlar Windows. Por eso el anfitrión utiliza la aplicación.</p></> : <><span className="dialog-hero-icon"><Link2 size={30} /></span><span className="eyebrow">MENOS DISTANCIA. MÁS CONEXIÓN.</span><h2 id="dialog-title">Tu equipo.<br />Al otro lado.</h2><p>Inhouse Link transmite el vídeo y el audio del PC y devuelve tus acciones de teclado y ratón mediante WebRTC.</p><div className="explanation-list"><div><ShieldCheck size={20} /><span><strong>Cada conexión necesita permiso</strong>El código inicia una solicitud. El anfitrión decide si acepta y puede retirar el acceso.</span></div><div><Wifi size={20} /><span><strong>La red marca la diferencia</strong>Una conexión directa suele dar mejor respuesta. Un servidor intermedio ayuda cuando la red no permite conectarlos directamente, aunque puede añadir demora.</span></div><div><Gauge size={20} /><span><strong>Datos medidos, no promesas</strong>Las estadísticas muestran medidas reales del navegador. No representan una comparación medida con otros programas.</span></div><div><Headphones size={20} /><span><strong>Primera versión</strong>Teclado, ratón, pantalla y audio según el sistema. Los mandos y HDR requieren desarrollo adicional.</span></div></div><button className="button button-primary" onClick={() => setModal(null)}>Entendido<ArrowRight size={18} /></button></>}</section></div>}
+    {modal && <div className="modal-backdrop" onClick={event => { if (event.target === event.currentTarget) setModal(null); }}><section className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button className="icon-button dialog-close" aria-label="Cerrar ventana" onClick={() => setModal(null)}><X size={20} /></button>{modal === 'download' ? <><span className="dialog-hero-icon"><Monitor size={30} /></span><span className="eyebrow">EL PC SE QUEDA. TÚ TE MUEVES.</span><h2 id="dialog-title">Todo empieza<br />en tu PC Windows.</h2><p>La aplicación de Inhouse Link comparte tu pantalla y permite el control remoto. Después podrás entrar desde este navegador o desde otro Windows.</p><ol className="setup-steps"><li><span>1</span>Abre la app en el PC que tiene tus juegos.</li><li><span>2</span>Entra con Google y deja «Disponible para ti» activado.</li><li><span>3</span>Entra con la misma cuenta en tu portátil y elige tu PC.</li></ol>{resolvedWindowsDownload ? <a className="button button-primary" href={resolvedWindowsDownload} download><ArrowDownToLine size={18} />Descargar para Windows<ArrowUpRight size={17} /></a> : <div className="download-notice"><ArrowDownToLine size={18} /><span>El ejecutable Windows todavía no está disponible en este servidor. Necesitas la compilación de la app para compartir el PC.</span></div>}<p className="dialog-fineprint">Compartir pantalla desde el navegador no permite controlar Windows. Por eso el anfitrión utiliza la aplicación.</p></> : <><span className="dialog-hero-icon"><Link2 size={30} /></span><span className="eyebrow">MENOS DISTANCIA. MÁS CONEXIÓN.</span><h2 id="dialog-title">Tu equipo.<br />Al otro lado.</h2><p>Inhouse Link transmite el vídeo y el audio del PC y devuelve tus acciones de teclado y ratón mediante WebRTC.</p><div className="explanation-list"><div><ShieldCheck size={20} /><span><strong>Tu cuenta autoriza tus equipos</strong>Con la misma cuenta Google puedes conectar directamente a tus PCs disponibles. Desactiva su disponibilidad para retirar el acceso.</span></div><div><Wifi size={20} /><span><strong>La red marca la diferencia</strong>Una conexión directa suele dar mejor respuesta. Un servidor intermedio ayuda cuando la red no permite conectarlos directamente, aunque puede añadir demora.</span></div><div><Gauge size={20} /><span><strong>Datos medidos, no promesas</strong>Las estadísticas muestran medidas reales del navegador. No representan una comparación medida con otros programas.</span></div><div><Headphones size={20} /><span><strong>Primera versión</strong>Teclado, ratón, pantalla y audio según el sistema. Los mandos y HDR requieren desarrollo adicional.</span></div></div><button className="button button-primary" onClick={() => setModal(null)}>Entendido<ArrowRight size={18} /></button></>}</section></div>}
 
     {toast && <div className="toast" role="status"><span>{toast}</span><button className="icon-button" aria-label="Cerrar notificación" onClick={() => setToast('')}><X size={16} /></button></div>}
   </div>;

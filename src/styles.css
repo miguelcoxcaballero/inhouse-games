@@ -3246,3 +3246,26 @@ kbd {
     font-size: 26px
   }
 }
+/* Account-owned computers are the primary connection route. */
+.account-computers { margin: 0 0 34px; padding: 30px; border: 1px solid var(--border, #34332e); border-radius: 20px; background: var(--panel, #181816); }
+.account-computers-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 24px; }
+.account-computers-heading h2 { font-family: 'Comfortaa', sans-serif; font-size: clamp(23px, 3vw, 32px); margin: 12px 0; }
+.account-computers-heading p, .account-device-card p, .account-empty-devices { color: #a6a49b; font-size: 14px; line-height: 1.7; }
+.account-online-count { display: flex; align-items: center; gap: 9px; white-space: nowrap; color: #b9b6ab; font-size: 12px; padding-top: 6px; }
+.account-device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr)); gap: 16px; }
+.account-device-card { display: flex; flex-direction: column; align-items: flex-start; padding: 24px; border: 1px solid #3b3931; border-radius: 14px; background: #20201c; min-width: 0; }
+.account-device-card h3 { font-family: 'Comfortaa', sans-serif; font-size: 17px; overflow-wrap: anywhere; margin: 10px 0 0; }
+.account-device-card p { margin: 12px 0 20px; }
+.account-device-card .button { width: 100%; margin-top: auto; }
+.account-device-icon { position: relative; display: grid; place-items: center; width: 50px; height: 50px; color: #e08a52; border-radius: 12px; background: #e07a3c12; margin-bottom: 20px; }
+.account-device-icon .tiny-dot { position: absolute; right: 3px; bottom: 5px; }
+.account-device-meta { display: block; color: #9a988e; font-size: 11px; line-height: 1.6; margin-top: 14px; }
+.account-local-device { background: #1c1d19; }
+.account-host-switch { display: flex; align-items: center; gap: 11px; color: #ded9c8; font-size: 12px; line-height: 1.5; margin-top: auto; cursor: pointer; }
+.account-host-switch input { width: 18px; height: 18px; accent-color: #e07a3c; flex: 0 0 auto; }
+.account-service-notice { display: flex; align-items: flex-start; gap: 15px; padding: 18px; margin-bottom: 20px; border: 1px solid #e07a3c48; border-radius: 12px; background: #e07a3c09; color: #e6d8c3; }
+.account-service-notice > svg { color: #e08a52; flex: 0 0 auto; }
+.account-service-notice p { color: #b3ad9e; font-size: 13px; line-height: 1.7; margin: 7px 0 12px; }
+.account-service-notice .text-button { margin-right: 20px; display: inline-flex; }
+.account-empty-devices { margin: 20px 0 0; }
+@media (max-width: 640px) { .account-computers { padding: 20px; } .account-computers-heading { display: block; } .account-online-count { margin-top: 16px; } }

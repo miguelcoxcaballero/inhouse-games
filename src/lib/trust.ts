@@ -11,6 +11,9 @@ const DEVICES_KEY = 'inhouse.trustedDevices.v1';
 const IDENTITY_KEY = 'inhouse.hostIdentity.v1';
 const encoder = new TextEncoder();
 let revision = 0;
+type Identity = { publicKey: JsonWebKey; privateKey: JsonWebKey };
+type ReadyIdentity = { identity: Identity; privateKey: CryptoKey };
+const pendingIdentities = new Map<string, { revision: number; promise: Promise<ReadyIdentity> }>();
 
 function accountKey(key: string): string {
   const account = getGoogleSession()?.profile.id;
@@ -92,24 +95,47 @@ export async function verifyProof(token: string, text: string, proof: string): P
 export async function identityForNonce(nonce: string) {
   const storageKey = accountKey(IDENTITY_KEY);
   const startedRevision = revision;
-  type Identity = { publicKey: JsonWebKey; privateKey: JsonWebKey };
-  let identity: Identity | null = null;
-  try { identity = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Identity | null; } catch { /* Generate a fresh local identity. */ }
-  let privateKey: CryptoKey | null = null;
-  if (identity?.privateKey && identity.publicKey) {
-    try { privateKey = await crypto.subtle.importKey('jwk', identity.privateKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']); }
-    catch { identity = null; }
-  }
-  if (!privateKey || !identity) {
-    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-    identity = { publicKey: await crypto.subtle.exportKey('jwk', pair.publicKey), privateKey: await crypto.subtle.exportKey('jwk', pair.privateKey) };
+  const assertCurrentAccount = () => {
     if (revision !== startedRevision || accountKey(IDENTITY_KEY) !== storageKey) throw new Error('La cuenta de Google ha cambiado.');
-    localStorage.setItem(storageKey, JSON.stringify(identity));
-    privateKey = pair.privateKey;
+  };
+  let pending = pendingIdentities.get(storageKey);
+  if (!pending || pending.revision !== startedRevision) {
+    const promise = (async (): Promise<ReadyIdentity> => {
+      let identity: Identity | null = null;
+      try { identity = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Identity | null; } catch { /* Generate a fresh local identity. */ }
+      let privateKey: CryptoKey | null = null;
+      if (identity?.privateKey && identity.publicKey) {
+        try { privateKey = await crypto.subtle.importKey('jwk', identity.privateKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']); }
+        catch { identity = null; }
+        assertCurrentAccount();
+      }
+      if (!privateKey || !identity) {
+        const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+        assertCurrentAccount();
+        const publicKey = await crypto.subtle.exportKey('jwk', pair.publicKey);
+        assertCurrentAccount();
+        const exportedPrivateKey = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        assertCurrentAccount();
+        identity = { publicKey, privateKey: exportedPrivateKey };
+        localStorage.setItem(storageKey, JSON.stringify(identity));
+        privateKey = pair.privateKey;
+      }
+      return { identity, privateKey };
+    })();
+    const entry = { revision: startedRevision, promise };
+    pendingIdentities.set(storageKey, entry);
+    const clearPending = () => { if (pendingIdentities.get(storageKey) === entry) pendingIdentities.delete(storageKey); };
+    void promise.then(clearPending, clearPending);
+    pending = entry;
   }
-  const { crv, kty, x, y } = identity.publicKey;
+  const { identity, privateKey } = await pending.promise;
+  assertCurrentAccount();
+  const publicKey = { ...identity.publicKey };
+  const { crv, kty, x, y } = publicKey;
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify({ crv, kty, x, y })));
+  assertCurrentAccount();
   const deviceId = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('').slice(0, 32);
   const signature = base64url(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, encoder.encode(nonce)));
-  return { deviceId, identity: { publicKey: identity.publicKey, signature } };
+  assertCurrentAccount();
+  return { deviceId, identity: { publicKey, signature } };
 }

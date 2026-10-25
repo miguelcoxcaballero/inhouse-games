@@ -233,7 +233,7 @@ function makeIdentity() {
   };
 }
 
-test('authenticated host identity has a stable address and forwards nonce-bound trust without auto-approval', async (t) => {
+test('authenticated host identity forwards nonce-bound stable-address trust without auto-approval', async (t) => {
   const f = await fixture(t);
   const identity = makeIdentity();
   const host = await f.client();
@@ -249,6 +249,7 @@ test('authenticated host identity has a stable address and forwards nonce-bound 
   viewer.send({ type: 'join', code: identity.deviceId, trust: { id: 'trusted-viewer-123', proof, nonce: 'attacker-controlled-nonce' } });
   await viewer.next('pending');
   const request = await host.next('join-request');
+  assert.equal(request.trustedOnly, true);
   assert.deepEqual(request.trust, { id: 'trusted-viewer-123', proof, nonce: viewerHello.nonce });
   viewer.send({ type: 'signal', signal: { description: { type: 'offer', sdp: 'not-approved' } } });
   assert.match((await viewer.next('error')).message, /aprobación/);
@@ -281,21 +282,21 @@ test('host identity cannot be claimed with another connection signature or repla
 
 test('stable authenticated hosts remain discoverable after anonymous invitation expiry', async (t) => {
   let clock = 1000;
-  const f = await fixture(t, { now: () => clock, roomTtlMs: 20, cleanupIntervalMs: 5 });
-  const host = await f.client();
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier, now: () => clock, roomTtlMs: 20, cleanupIntervalMs: 5 });
+  const host = await f.client(undefined, googleProtocols('test-google-host-token'));
   const identity = makeIdentity();
   const hello = await host.next('hello');
   host.send({ type: 'host', identity: identity.response(hello.nonce) });
   await host.next('hosted');
   clock += 100;
   await new Promise((resolve) => setTimeout(resolve, 20));
-  const viewer = await f.client();
+  const viewer = await f.client(undefined, googleProtocols('test-google-host-token'));
   viewer.send({ type: 'join', code: identity.deviceId });
-  assert.equal((await viewer.next('pending')).type, 'pending');
+  assert.equal((await viewer.next('paired')).accountAuthorized, true);
   host.send({ type: 'leave' });
-  await viewer.next('error');
+  await viewer.next('peer-left');
   viewer.send({ type: 'join', code: identity.deviceId });
-  assert.match((await viewer.next('error')).message, /caducado/);
+  assert.match((await viewer.next('error')).message, /disponible/);
 });
 
 test('a configured service key protects ICE config and signaling without reflecting its credential', async (t) => {
@@ -361,6 +362,191 @@ async function testGoogleVerifier(token) {
 }
 
 function googleProtocols(token) { return ['inhouse-link-v1', `google.${Buffer.from(token).toString('base64url')}`]; }
+
+async function registeredHost(f, token = 'test-google-host-token', name = 'PC Murcia', identity = makeIdentity()) {
+  const host = await f.client(undefined, googleProtocols(token));
+  const hello = await host.next('hello');
+  host.send({ type: 'host', name, identity: identity.response(hello.nonce), account: { id: 'client-claimed-owner-ignored' } });
+  const hosted = await host.next('hosted');
+  assert.equal(hosted.deviceId, identity.deviceId);
+  return { host, identity, ...hosted };
+}
+
+test('online device subscriptions show only signed hosts of the verified account', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const owner = await f.client(undefined, googleProtocols('test-google-host-token'));
+  const outsider = await f.client(undefined, googleProtocols('test-google-viewer-token'));
+  owner.send({ type: 'devices', account: TEST_ACCOUNTS['test-google-viewer-token'] });
+  outsider.send({ type: 'devices', account: TEST_ACCOUNTS['test-google-host-token'] });
+  assert.deepEqual((await owner.next('devices')).devices, []);
+  assert.deepEqual((await outsider.next('devices')).devices, []);
+  const own = await registeredHost(f);
+  assert.deepEqual((await owner.next('devices')).devices, [{ deviceId: own.deviceId, name: 'PC Murcia', online: true, busy: false }]);
+  await assert.rejects(outsider.next('devices', 40), /Timed out/);
+  const foreign = await registeredHost(f, 'test-google-viewer-token', 'Otro PC');
+  assert.deepEqual((await outsider.next('devices')).devices, [{ deviceId: foreign.deviceId, name: 'Otro PC', online: true, busy: false }]);
+  await assert.rejects(owner.next('devices', 40), /Timed out/);
+  owner.send({ type: 'devices' });
+  assert.equal((await owner.next('devices')).devices[0].deviceId, own.deviceId);
+  const unverifiedFixture = await fixture(t);
+  const anonymous = await unverifiedFixture.client();
+  anonymous.send({ type: 'devices' });
+  assert.match((await anonymous.next('error')).message, /Google/);
+});
+
+test('same-account device connections pair without host approval and broadcast busy/available states', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const observer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  observer.send({ type: 'devices' });
+  await observer.next('devices');
+  const device = await registeredHost(f);
+  await observer.next('devices');
+  const viewer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  viewer.send({ type: 'join', code: device.deviceId });
+  assert.equal((await viewer.next('approved')).accountAuthorized, true);
+  const [hostPair, viewerPair] = await Promise.all([device.host.next('paired'), viewer.next('paired')]);
+  assert.equal(hostPair.accountAuthorized, true);
+  assert.equal(viewerPair.accountAuthorized, true);
+  assert.equal(hostPair.connectionId, viewerPair.connectionId);
+  assert.equal(hostPair.deviceName, 'PC Murcia');
+  assert.equal(viewerPair.deviceName, 'PC Murcia');
+  assert.equal((await observer.next('devices')).devices[0].busy, true);
+  await assert.rejects(device.host.next('join-request', 30), /Timed out/);
+  viewer.send({ type: 'signal', signal: { description: { type: 'answer', sdp: 'allowed-without-manual-approval' } } });
+  assert.equal((await device.host.next('signal')).signal.description.sdp, 'allowed-without-manual-approval');
+  const busyViewer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  busyViewer.send({ type: 'join', code: device.deviceId });
+  assert.match((await busyViewer.next('error')).message, /activa/);
+  viewer.send({ type: 'leave' });
+  await device.host.next('peer-left');
+  assert.equal((await observer.next('devices')).devices[0].busy, false);
+  busyViewer.send({ type: 'join', code: device.deviceId });
+  const reconnected = await busyViewer.next('paired');
+  assert.equal(reconnected.accountAuthorized, true);
+  assert.notEqual(reconnected.connectionId, hostPair.connectionId);
+});
+
+test('a host disappearing and reconnecting updates its account list with the same device identity', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const observer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  observer.send({ type: 'devices' });
+  await observer.next('devices');
+  const device = await registeredHost(f);
+  await observer.next('devices');
+  device.host.ws.close();
+  assert.deepEqual((await observer.next('devices')).devices, []);
+  const restored = await registeredHost(f, 'test-google-host-token', 'PC Murcia de nuevo', device.identity);
+  assert.equal(restored.deviceId, device.deviceId);
+  assert.deepEqual((await observer.next('devices')).devices, [{ deviceId: device.deviceId, name: 'PC Murcia de nuevo', online: true, busy: false }]);
+});
+
+test('another Google account cannot connect by a device ID but can request an invitation code', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const device = await registeredHost(f);
+  const outsider = await f.client(undefined, googleProtocols('test-google-viewer-token'));
+  outsider.send({ type: 'join', code: device.deviceId, accountAuthorized: true, account: TEST_ACCOUNTS['test-google-host-token'] });
+  const error = await outsider.next('error');
+  assert.match(error.message, /disponible/);
+  assert.ok(!JSON.stringify(error).includes('owner@example.test'));
+  outsider.send({ type: 'join', code: device.code });
+  await outsider.next('pending');
+  const request = await device.host.next('join-request');
+  assert.equal(request.account.id, TEST_ACCOUNTS['test-google-viewer-token'].id);
+  outsider.send({ type: 'signal', signal: { description: { type: 'offer', sdp: 'not-authorized' } } });
+  assert.match((await outsider.next('error')).message, /aprobación/);
+  device.host.send({ type: 'approve', id: request.id, allow: true });
+  const pair = await outsider.next('paired');
+  assert.equal(pair.accountAuthorized, undefined);
+});
+
+test('native account grants require the active host session, account, device and current pair', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const hostSession = await durableSession(f);
+  const otherSameAccountSession = await durableSession(f);
+  const foreignSession = await durableSession(f, 'test-google-viewer-token');
+  const device = await registeredHost(f, hostSession.accessToken);
+  const viewer = await f.client(undefined, googleProtocols(otherSameAccountSession.accessToken));
+  viewer.send({ type: 'join', code: device.deviceId });
+  const pair = await device.host.next('paired');
+  await viewer.next('paired');
+  const endpoint = `${f.base}/api/account/connection/${pair.connectionId}`;
+  const get = (token) => fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
+  const granted = await get(hostSession.accessToken);
+  assert.equal(granted.status, 200);
+  const grant = await granted.json();
+  assert.deepEqual({ ...grant, expiresAt: null }, {
+    connectionId: pair.connectionId, hostId: device.deviceId,
+    ownerAccountId: TEST_ACCOUNTS['test-google-host-token'].id,
+    viewerAccountId: TEST_ACCOUNTS['test-google-host-token'].id, active: true, expiresAt: null,
+  });
+  assert.ok(grant.expiresAt > Date.now() && grant.expiresAt <= Date.now() + 60_000);
+  assert.equal((await get(otherSameAccountSession.accessToken)).status, 404);
+  assert.equal((await get(foreignSession.accessToken)).status, 404);
+  assert.equal((await get('test-google-host-token')).status, 404);
+  viewer.send({ type: 'leave' });
+  await device.host.next('peer-left');
+  assert.equal((await get(hostSession.accessToken)).status, 404);
+});
+
+test('cross-account legacy proofs stay host-verified, cannot request account grants and can be silently rejected', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const hostSession = await durableSession(f);
+  const device = await registeredHost(f, hostSession.accessToken);
+  const outsider = await f.client(undefined, googleProtocols('test-google-viewer-token'));
+  const hello = await outsider.next('hello');
+  const trust = { id: 'legacy-device-123', proof: createHmac('sha256', 'existing-secret-known-only-by-host').update(`${hello.nonce}:${device.deviceId}`).digest('base64url') };
+  outsider.send({ type: 'join', code: device.deviceId, trust });
+  await outsider.next('pending');
+  const request = await device.host.next('join-request');
+  assert.equal(request.trustedOnly, true);
+  assert.equal(request.accountAuthorized, undefined);
+  assert.equal(request.trust.nonce, hello.nonce);
+  outsider.send({ type: 'signal', signal: { description: { type: 'offer', sdp: 'not-yet-verified' } } });
+  assert.match((await outsider.next('error')).message, /aprobación/);
+  device.host.send({ type: 'approve', id: request.id, allow: false });
+  await outsider.next('rejected');
+  outsider.send({ type: 'join', code: device.deviceId, trust });
+  const second = await device.host.next('join-request');
+  device.host.send({ type: 'approve', id: second.id, allow: true });
+  const pair = await outsider.next('paired');
+  assert.equal(pair.accountAuthorized, undefined);
+  const grant = await fetch(`${f.base}/api/account/connection/${pair.connectionId}`, { headers: { Authorization: `Bearer ${hostSession.accessToken}` } });
+  assert.equal(grant.status, 404);
+});
+
+test('host disconnect-peer revokes the pair grant but keeps its device online and reconnectable', async (t) => {
+  const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });
+  const hostSession = await durableSession(f);
+  const observer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  observer.send({ type: 'devices' });
+  await observer.next('devices');
+  const device = await registeredHost(f, hostSession.accessToken);
+  await observer.next('devices');
+  const viewer = await f.client(undefined, googleProtocols('test-google-host-token'));
+  viewer.send({ type: 'join', code: device.deviceId });
+  const initial = await device.host.next('paired');
+  await viewer.next('paired');
+  assert.equal((await observer.next('devices')).devices[0].busy, true);
+  const grantUrl = `${f.base}/api/account/connection/${initial.connectionId}`;
+  const grantRequest = () => fetch(grantUrl, { headers: { Authorization: `Bearer ${hostSession.accessToken}` } });
+  assert.equal((await grantRequest()).status, 200);
+  device.host.send({ type: 'disconnect-peer' });
+  await Promise.all([viewer.next('peer-left'), device.host.next('peer-left')]);
+  assert.equal((await grantRequest()).status, 404);
+  assert.deepEqual((await observer.next('devices')).devices, [{ deviceId: device.deviceId, name: 'PC Murcia', online: true, busy: false }]);
+  device.host.send({ type: 'disconnect-peer' });
+  device.host.send({ type: 'ping' });
+  await device.host.next('pong');
+  await assert.rejects(device.host.next('error', 30), /Timed out/);
+  viewer.send({ type: 'join', code: device.deviceId });
+  const next = await viewer.next('paired');
+  assert.equal(next.accountAuthorized, true);
+  assert.notEqual(next.connectionId, initial.connectionId);
+  viewer.send({ type: 'disconnect-peer' });
+  assert.match((await viewer.next('error')).message, /anfitrión/);
+  viewer.send({ type: 'signal', signal: { description: { type: 'answer', sdp: 'pair-still-active' } } });
+  assert.equal((await device.host.next('signal')).signal.description.sdp, 'pair-still-active');
+});
 
 test('Google authentication is required by default for config and signaling', async (t) => {
   const f = await fixture(t, { googleAuth: true, googleVerifier: testGoogleVerifier });

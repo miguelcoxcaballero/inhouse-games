@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleTokenVerifier, DEFAULT_GOOGLE_CLIENT_ID, GoogleAuthError, validGoogleAccessToken } from './google-auth.mjs';
 import { AccountSessionStore, validAppToken } from './account-sessions.mjs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const SIGNAL_PROTOCOL = 'inhouse-link-v1';
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MIME = {
@@ -118,8 +118,8 @@ function send(client, message) {
 }
 
 /**
- * Local signaling and static web server. Sessions are intentionally ephemeral;
- * codes authorize a request, while the host must separately approve the viewer.
+ * Local signaling and static web server. Verified account owners can reach
+ * their own online hosts; invitations from other accounts require approval.
  */
 export function createSignalingServer(options = {}) {
   const env = options.env ?? process.env;
@@ -153,6 +153,7 @@ export function createSignalingServer(options = {}) {
   const clients = new Set();
   const rooms = new Map();
   const roomsByDevice = new Map();
+  const activeConnections = new Map();
   const perIp = new Map();
   const upgrading = new Map();
   const upgradingSockets = new Set();
@@ -273,7 +274,7 @@ export function createSignalingServer(options = {}) {
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), display-capture=(self)');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://accounts.google.com; style-src 'self' 'unsafe-inline' https://accounts.google.com; img-src 'self' data: blob: https://*.googleusercontent.com; frame-src https://accounts.google.com; media-src 'self' blob:; connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://accounts.google.com; style-src 'self' 'unsafe-inline' https://accounts.google.com; img-src 'self' data: blob: https://*.googleusercontent.com; frame-src https://accounts.google.com; worker-src 'self' blob:; media-src 'self' blob:; connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
   }
 
   function json(res, status, value) {
@@ -297,7 +298,8 @@ export function createSignalingServer(options = {}) {
     if (pathname.includes('\0') || pathname.includes('\\') || pathname.split('/').includes('..')) {
       return json(res, 403, { error: 'Forbidden' });
     }
-    if (pathname === '/api/config' || pathname === '/api/auth/session') {
+    const accountConnection = /^\/api\/account\/connection\/([a-f0-9-]{36})$/i.exec(pathname);
+    if (pathname === '/api/config' || pathname === '/api/auth/session' || accountConnection) {
       const methods = pathname === '/api/auth/session' ? ['GET', 'HEAD', 'POST', 'DELETE'] : ['GET', 'HEAD'];
       if (!originAllowed(req)) return json(res, 403, { error: 'Origin not allowed' });
       const origin = req.headers.origin;
@@ -327,6 +329,25 @@ export function createSignalingServer(options = {}) {
       catch (error) {
         res.setHeader('WWW-Authenticate', 'Bearer realm="Google Inhouse"');
         return json(res, error.status ?? 401, { error: error.message });
+      }
+      if (accountConnection) {
+        const connection = activeConnections.get(accountConnection[1]);
+        const connectionHost = connection?.host;
+        const viewer = connection?.viewer;
+        if (!account || !connection?.accountAuthorized || !connectionHost?.deviceId || !viewer
+          || account.id !== connectionHost.account?.id
+          || (connectionHost.account.sessionHash && account.sessionHash !== connectionHost.account.sessionHash)
+          || connectionHost.peer !== viewer || viewer.peer !== connectionHost
+          || connectionHost.ws.readyState !== WebSocket.OPEN || viewer.ws.readyState !== WebSocket.OPEN
+          || !connectionHost.room || !sameAccount(viewer, connectionHost.room)) {
+          return json(res, 404, { error: 'La conexión de este equipo no está disponible.' });
+        }
+        const expiresAt = Math.min(now() + 60_000, connectionHost.account.expiresAt, viewer.account.expiresAt);
+        if (expiresAt <= now()) return json(res, 404, { error: 'La conexión de este equipo no está disponible.' });
+        return json(res, 200, {
+          connectionId: accountConnection[1], hostId: connectionHost.deviceId,
+          ownerAccountId: connectionHost.account.id, viewerAccountId: viewer.account.id, expiresAt, active: true,
+        });
       }
       if (pathname === '/api/auth/session') {
         if (req.method === 'POST') {
@@ -395,6 +416,59 @@ export function createSignalingServer(options = {}) {
 
   function error(client, message) { send(client, { type: 'error', message }); }
 
+  function accountSessionActive(client) {
+    return Boolean(client.account?.id) && (!client.account.sessionHash || client.account.expiresAt > now());
+  }
+
+  function sameAccount(client, room) {
+    return accountSessionActive(client) && accountSessionActive(room.host) && client.account.id === room.owner?.id;
+  }
+
+  function onlineDevices(accountId) {
+    return [...roomsByDevice.values()]
+      .filter((room) => room.owner?.id === accountId && accountSessionActive(room.host) && room.host.ws.readyState === WebSocket.OPEN)
+      .map((room) => ({ deviceId: room.host.deviceId, name: room.host.deviceName, online: true, busy: Boolean(room.host.peer) }))
+      .sort((a, b) => a.name.localeCompare(b.name) || a.deviceId.localeCompare(b.deviceId));
+  }
+
+  function sendDevices(client) {
+    if (accountSessionActive(client)) send(client, { type: 'devices', devices: onlineDevices(client.account.id) });
+  }
+
+  function broadcastDevices(accountId) {
+    if (!accountId) return;
+    for (const client of clients) {
+      if (client.deviceSubscription && client.account?.id === accountId) sendDevices(client);
+    }
+  }
+
+  function pair(room, viewer, accountAuthorized = false) {
+    const host = room.host;
+    const connectionId = randomUUID();
+    host.peer = viewer;
+    viewer.peer = host;
+    host.connectionId = connectionId;
+    viewer.connectionId = connectionId;
+    viewer.role = 'viewer';
+    viewer.room = room;
+    viewer.pendingId = null;
+    room.lastActivity = now();
+    const identity = host.deviceId ? { deviceId: host.deviceId } : {};
+    const authorization = accountAuthorized ? { accountAuthorized: true } : {};
+    activeConnections.set(connectionId, { host, viewer, accountAuthorized });
+    if (accountAuthorized) send(viewer, { type: 'approved', ...authorization, ...identity, name: host.name, deviceName: host.deviceName, account: publicAccount(host.account) });
+    send(host, { type: 'paired', peerId: viewer.id, name: viewer.name, account: publicAccount(viewer.account), initiator: true, deviceName: host.deviceName, connectionId, ...identity, ...authorization });
+    send(viewer, { type: 'paired', peerId: host.id, name: host.name, account: publicAccount(host.account), initiator: false, deviceName: host.deviceName, connectionId, ...identity, ...authorization });
+    for (const other of room.pending.values()) {
+      other.client.pendingId = null;
+      other.client.role = null;
+      other.client.room = null;
+      send(other.client, { type: 'rejected', message: 'El anfitrión ha aceptado otra conexión.' });
+    }
+    room.pending.clear();
+    broadcastDevices(room.owner?.id);
+  }
+
   function cancelPending(client, reason) {
     if (!client.pendingId || !client.room) return;
     const room = client.room;
@@ -408,13 +482,33 @@ export function createSignalingServer(options = {}) {
     if (reason) error(client, reason);
   }
 
+  function disconnectPeer(host) {
+    const viewer = host.peer;
+    if (!viewer) return;
+    if (host.connectionId) activeConnections.delete(host.connectionId);
+    host.connectionId = null;
+    host.peer = null;
+    viewer.connectionId = null;
+    viewer.peer = null;
+    viewer.pendingId = null;
+    viewer.role = null;
+    viewer.room = null;
+    host.room.lastActivity = now();
+    send(viewer, { type: 'peer-left' });
+    send(host, { type: 'peer-left' });
+    broadcastDevices(host.room.owner?.id);
+  }
+
   function leave(client) {
     cancelPending(client);
     const room = client.room;
+    if (client.connectionId) activeConnections.delete(client.connectionId);
+    client.connectionId = null;
     if (client.peer) {
       const peer = client.peer;
       client.peer = null;
       peer.peer = null;
+      peer.connectionId = null;
       send(peer, { type: 'peer-left' });
       if (peer.role === 'viewer') {
         peer.role = null;
@@ -436,6 +530,7 @@ export function createSignalingServer(options = {}) {
     }
     client.role = null;
     client.room = null;
+    broadcastDevices(room?.owner?.id);
   }
 
   httpServer.on('upgrade', async (req, socket, head) => {
@@ -476,13 +571,14 @@ export function createSignalingServer(options = {}) {
 
   wss.on('connection', (ws, req) => {
     const ip = requestIp(req);
-    const client = { id: randomUUID(), ws, ip, account: req.inhouseAccount, nonce: randomBytes(32).toString('base64url'), deviceId: null, name: 'Equipo', role: null, room: null, peer: null, pendingId: null, alive: true, bucketStart: now(), count: 0 };
+    const client = { id: randomUUID(), ws, ip, account: req.inhouseAccount, nonce: randomBytes(32).toString('base64url'), deviceId: null, name: 'Equipo', deviceName: 'PC Inhouse', deviceSubscription: false, connectionId: null, role: null, room: null, peer: null, pendingId: null, alive: true, bucketStart: now(), count: 0 };
     clients.add(client);
     perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
     send(client, { type: 'hello', nonce: client.nonce, account: publicAccount(client.account) });
     ws.on('pong', () => { client.alive = true; });
     ws.on('error', () => { /* socket close owns cleanup; never log raw signaling */ });
     ws.on('message', (data, isBinary) => {
+      if (client.account?.sessionHash && !accountSessionActive(client)) { ws.close(1008, 'Account session expired'); return; }
       if (isBinary) return error(client, 'Solo se admiten mensajes JSON.');
       const time = now();
       if (time - client.bucketStart > 1000) { client.bucketStart = time; client.count = 0; }
@@ -492,6 +588,12 @@ export function createSignalingServer(options = {}) {
       if (!plain(message) || typeof message.type !== 'string') return error(client, 'Mensaje inválido.');
       switch (message.type) {
         case 'ping': send(client, { type: 'pong' }); break;
+        case 'devices': {
+          if (!accountSessionActive(client)) return error(client, 'Entra con Google para ver tus equipos.');
+          client.deviceSubscription = message.subscribe !== false;
+          sendDevices(client);
+          break;
+        }
         case 'host': {
           if (client.role || client.pendingId) return error(client, 'Ya hay una sesión activa.');
           if (!permitRequest(ip, 'host', 30, 60_000)) return error(client, 'Demasiados intentos. Espera un minuto.');
@@ -503,11 +605,13 @@ export function createSignalingServer(options = {}) {
           const room = { code, host: client, owner: publicAccount(client.account), pending: new Map(), lastActivity: time };
           client.role = 'host';
           client.name = accountName(client.account, cleanName(message.name, 'PC anfitrión'));
+          client.deviceName = cleanName(message.name, 'PC Inhouse');
           client.deviceId = deviceId;
           client.room = room;
           rooms.set(code, room);
           if (deviceId) roomsByDevice.set(deviceId, room);
           send(client, { type: 'hosted', code: `${code.slice(0, 4)}-${code.slice(4)}`, account: publicAccount(client.account), ...(deviceId ? { deviceId } : {}) });
+          broadcastDevices(room.owner?.id);
           break;
         }
         case 'join': {
@@ -516,19 +620,23 @@ export function createSignalingServer(options = {}) {
           const stableId = typeof message.code === 'string' && /^[a-fA-F0-9]{32}$/.test(message.code.trim()) ? message.code.trim().toLowerCase() : null;
           const code = normalizeCode(message.code);
           const room = stableId ? roomsByDevice.get(stableId) : code && rooms.get(code);
-          if (!room || room.host.ws.readyState !== WebSocket.OPEN) return error(client, 'Código no válido o caducado.');
+          if (!room || room.host.ws.readyState !== WebSocket.OPEN) return error(client, stableId ? 'Este equipo no está disponible para esta cuenta.' : 'Código no válido o caducado.');
+          const ownerConnection = sameAccount(client, room);
+          const trustedOnly = Boolean(stableId && !ownerConnection);
+          if (trustedOnly && !validTrust(message.trust)) return error(client, 'Este equipo no está disponible para esta cuenta.');
           if (message.trust !== undefined && !validTrust(message.trust)) return error(client, 'La prueba de confianza no es válida.');
           if (room.host.peer) return error(client, 'Este PC ya tiene una conexión activa.');
-          if (room.pending.size >= 5) return error(client, 'Hay demasiadas solicitudes pendientes.');
           client.name = accountName(client.account, cleanName(message.name, 'Portátil'));
+          if (ownerConnection) { pair(room, client, true); break; }
+          if (room.pending.size >= 5) return error(client, 'Hay demasiadas solicitudes pendientes.');
           const id = randomUUID();
           client.role = 'viewer';
           client.room = room;
           client.pendingId = id;
-          room.pending.set(id, { client, createdAt: time });
+          room.pending.set(id, { client, createdAt: time, trustedOnly });
           room.lastActivity = time;
           send(client, { type: 'pending' });
-          send(room.host, { type: 'join-request', id, name: client.name, account: publicAccount(client.account),
+          send(room.host, { type: 'join-request', id, name: client.name, account: publicAccount(client.account), ...(trustedOnly ? { trustedOnly: true } : {}),
             ...(message.trust ? { trust: { id: message.trust.id, proof: message.trust.proof, nonce: client.nonce } } : {}) });
           break;
         }
@@ -554,19 +662,7 @@ export function createSignalingServer(options = {}) {
             send(viewer, { type: 'rejected', message: 'El anfitrión ha rechazado la conexión.' });
             return;
           }
-          client.peer = viewer;
-          viewer.peer = client;
-          room.lastActivity = time;
-          const identity = client.deviceId ? { deviceId: client.deviceId } : {};
-          send(client, { type: 'paired', peerId: viewer.id, name: viewer.name, account: publicAccount(viewer.account), initiator: true, ...identity });
-          send(viewer, { type: 'paired', peerId: client.id, name: client.name, account: publicAccount(client.account), initiator: false, ...identity });
-          for (const other of room.pending.values()) {
-            other.client.pendingId = null;
-            other.client.role = null;
-            other.client.room = null;
-            send(other.client, { type: 'rejected', message: 'El anfitrión ha aceptado otra conexión.' });
-          }
-          room.pending.clear();
+          pair(room, viewer);
           break;
         }
         case 'signal': {
@@ -574,6 +670,11 @@ export function createSignalingServer(options = {}) {
           if (!validSignal(message.signal)) return error(client, 'Señal WebRTC inválida.');
           if (client.room) client.room.lastActivity = time;
           send(client.peer, { type: 'signal', signal: message.signal });
+          break;
+        }
+        case 'disconnect-peer': {
+          if (client.role !== 'host' || !client.room) return error(client, 'Solo el anfitrión puede finalizar la conexión de este equipo.');
+          disconnectPeer(client);
           break;
         }
         case 'leave': leave(client); break;

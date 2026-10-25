@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   GOOGLE_CLIENT_ID, GOOGLE_SCOPE, GOOGLE_SESSION_KEY, GoogleAccount, getGoogleSession, ensureServiceAccountSession,
 } from '../src/lib/google-account.ts';
+import { CLOUD_ACCOUNT_KEY, createCloudAccountFromRealm, rememberCloudAccount, getCloudAccount } from '../src/lib/cloud-account.ts';
+import { useCloudAccountTransport } from '../src/lib/service-config.ts';
 
 const original = { fetch: globalThis.fetch, window: globalThis.window, localStorage: globalThis.localStorage };
 const memory = new Map();
@@ -111,8 +113,10 @@ test('restored sessions are revalidated with Google and rejected when access has
   assert.equal(getGoogleSession(), null);
 });
 
-test('native login uses the external-browser bridge and still verifies the Google profile', async () => {
+test('native login to an explicit Node service uses the external-browser bridge and still verifies the Google profile', async () => {
   let nativeCalls = 0;
+  localStorage.setItem('inhouse.signalingUrl', 'https://native-service.example.invalid');
+  globalThis.fetch = async url => String(url).startsWith('https://www.googleapis.com/') ? googleProfile() : new Response('{}', { status: 503 });
   delete window.google;
   window.inhouseDesktop = { googleSignIn: async () => { nativeCalls++; return { accessToken: 'native-synthetic-access', expiresAt: Date.now() + 3600_000 }; } };
   const { account: instance } = account();
@@ -219,9 +223,11 @@ test('signing out in another tab immediately notifies active session owners', as
   assert.equal(instance.state.status, 'signed-out');
 });
 
-test('native session expiry emits signed-out without silently reopening Google', async context => {
+test('native Google expiry for an explicit Node service emits signed-out without silently reopening Google', async context => {
   context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
   let nativeCalls = 0;
+  localStorage.setItem('inhouse.signalingUrl', 'https://native-service.example.invalid');
+  globalThis.fetch = async url => String(url).startsWith('https://www.googleapis.com/') ? googleProfile() : new Response('{}', { status: 503 });
   window.inhouseDesktop = { googleSignIn: async () => { nativeCalls++; throw new Error('must not open'); } };
   store({ expiresAt: Date.now() + 61_000 });
   const events = [];
@@ -414,4 +420,190 @@ test('a temporary service outage preserves a durable credential but does not fal
   await instance.signIn();
   assert.equal(instance.state.status, 'signed-in');
   assert.equal(getGoogleSession().accessToken, appToken);
+});
+
+const privateRealm = { id: 'drive-realm-fixture', fileId: 'drive-realm-fixture', accountId: profile.id, secret: 'A'.repeat(43) };
+const realmMetadata = {
+  id: privateRealm.fileId, createdTime: '2026-01-01T00:00:00.000Z', ownedByMe: true, shared: false,
+  appProperties: { 'inhouse.link.realm': '1' },
+};
+function pages() { window.location = new URL('https://miguelcoxcaballero.github.io/inhouse-games/#/client'); }
+function mirrorCloud(expiresAt = Date.now() + 30 * 86400_000) {
+  const cloud = createCloudAccountFromRealm(profile, privateRealm, expiresAt);
+  rememberCloudAccount(cloud);
+  store({ kind: 'cloud', accessToken: cloud.clientToken, expiresAt: cloud.expiresAt });
+  return cloud;
+}
+function cloudDriveResponse(url) {
+  const target = new URL(String(url));
+  if (target.pathname === '/drive/v3/about') return googleProfile();
+  if (target.pathname === '/drive/v3/files') return new Response(JSON.stringify({ files: [realmMetadata] }));
+  if (target.pathname === `/drive/v3/files/${privateRealm.fileId}`) {
+    return new Response(JSON.stringify(target.searchParams.get('alt') === 'media'
+      ? { schema: 1, accountId: profile.id, secret: privateRealm.secret } : realmMetadata));
+  }
+  throw new Error('Unexpected fixture request: ' + target.origin + target.pathname);
+}
+
+test('Pages signs in with the same Google grant and stores a separate private thirty-day capability', async () => {
+  pages(); immediateGoogle();
+  assert.equal(useCloudAccountTransport(), true);
+  const requests = [];
+  globalThis.fetch = async (url, request) => {
+    requests.push(String(url));
+    assert.equal(new URL(String(url)).origin, 'https://www.googleapis.com');
+    assert.equal(request.headers.Authorization, 'Bearer synthetic-google-access');
+    return cloudDriveResponse(url);
+  };
+  const { account: instance } = account();
+  const googleExpiry = Date.now() + 3600_000;
+  await instance.signIn();
+  assert.equal(instance.state.status, 'signed-in');
+  const session = getGoogleSession();
+  assert.equal(session.kind, 'cloud');
+  assert.match(session.accessToken, /^ild_[A-Za-z0-9_-]{43}$/);
+  assert.ok(session.expiresAt > googleExpiry, 'the local capability has its own lifetime');
+  assert.ok(session.expiresAt <= Date.now() + 30 * 86400_000);
+  assert.equal(session.issuer, undefined);
+  assert.equal(getCloudAccount().secret, privateRealm.secret);
+  assert.equal(instance.getOAuthSession(), null);
+  assert.equal([...memory.values()].some(value => value.includes('synthetic-google-access')), false);
+  assert.ok(requests.some(url => url.includes('/drive/v3/files?')));
+});
+
+test('a cloud profile or token alone cannot authenticate without its matching private realm capability', () => {
+  pages();
+  store({ kind: 'cloud', accessToken: 'ild_' + 'A'.repeat(43) });
+  assert.equal(getGoogleSession(), null);
+  const cloud = mirrorCloud();
+  assert.equal(getGoogleSession().accessToken, cloud.clientToken);
+  store({ kind: 'cloud', accessToken: cloud.clientToken, expiresAt: cloud.expiresAt, profile: { ...profile, email: 'another@example.invalid' } });
+  assert.equal(getGoogleSession(), null);
+  store({ accessToken: cloud.clientToken, expiresAt: cloud.expiresAt });
+  assert.equal(getGoogleSession(), null, 'a local capability cannot be mistaken for an OAuth token');
+  mirrorCloud();
+  localStorage.removeItem(CLOUD_ACCOUNT_KEY);
+  assert.equal(getGoogleSession(), null);
+});
+
+test('a valid browser cloud capability restores without treating it as a Google access token', async () => {
+  pages(); const cloud = mirrorCloud();
+  let requests = 0;
+  globalThis.fetch = async url => {
+    requests++;
+    assert.ok(String(url).endsWith('/service.json'));
+    return new Response(JSON.stringify({ schema: 1, signalingUrl: null }));
+  };
+  const { account: instance } = account();
+  await instance.initialize();
+  assert.equal(instance.state.status, 'signed-in');
+  assert.equal(getGoogleSession().accessToken, cloud.clientToken);
+  assert.ok(requests <= 1);
+});
+
+test('switching to an explicit server rejects a cloud capability without transmitting it', async () => {
+  pages(); mirrorCloud();
+  localStorage.setItem('inhouse.signalingUrl', serviceOrigin);
+  assert.equal(useCloudAccountTransport(), false);
+  assert.equal(getGoogleSession(), null);
+  let requests = 0;
+  globalThis.fetch = async () => { requests++; throw new Error('A local cloud capability must never leave this client.'); };
+  await assert.rejects(ensureServiceAccountSession(new URL(serviceOrigin)), /Inicia sesión/);
+  const { account: instance } = account();
+  await instance.initialize();
+  assert.equal(instance.state.status, 'signed-out');
+  assert.equal(getCloudAccount(), null);
+  assert.equal(requests, 0);
+});
+
+test('native cloud login uses its independently verified main-process realm and never persists the Google grant', async () => {
+  let calls = 0;
+  window.inhouseDesktop = {
+    cloudAccountRestore: async () => null,
+    googleSignIn: async options => {
+      calls++; assert.equal(options.cloudMode, true);
+      return {
+        accessToken: 'native-fresh-google-grant', expiresAt: Date.now() + 3600_000,
+        cloudRealm: privateRealm, profile, cloudSessionExpiresAt: Date.now() + 30 * 86400_000,
+      };
+    },
+  };
+  let googleCalls = 0;
+  globalThis.fetch = async url => { googleCalls++; assert.ok(String(url).includes('/drive/v3/about?')); return googleProfile(); };
+  const { account: instance } = account();
+  await instance.initialize();
+  await instance.signIn();
+  assert.equal(calls, 1);
+  assert.equal(googleCalls, 1);
+  assert.equal(instance.state.status, 'signed-in');
+  assert.equal(getGoogleSession().kind, 'cloud');
+  assert.equal([...memory.values()].some(value => value.includes('native-fresh-google-grant')), false);
+});
+
+test('native cloud restoration requires the main-process anchor even if the renderer remembers a realm', async () => {
+  window.inhouseDesktop = { cloudAccountRestore: async () => null };
+  mirrorCloud();
+  globalThis.fetch = async () => { throw new Error('No Google request is needed to reject an absent native anchor.'); };
+  const { account: instance } = account();
+  await instance.initialize();
+  assert.equal(instance.state.status, 'signed-out');
+  assert.equal(getGoogleSession(), null);
+  assert.equal(getCloudAccount(), null);
+  window.inhouseDesktop.cloudAccountRestore = async () => ({ realm: privateRealm, profile, expiresAt: Date.now() + 30 * 86400_000 });
+  await instance.initialize();
+  assert.equal(instance.state.status, 'signed-in');
+  assert.equal(getGoogleSession().kind, 'cloud');
+});
+
+test('cloud sign-out forgets local and native capabilities without deleting the private Drive file', async () => {
+  let forgotten = 0;
+  window.inhouseDesktop = { cloudAccountForget: () => { forgotten++; } };
+  mirrorCloud();
+  let requests = 0;
+  globalThis.fetch = async () => { requests++; throw new Error('Signing out must not delete a Drive file.'); };
+  const { account: instance } = account();
+  instance.signOut();
+  assert.equal(instance.state.status, 'signed-out');
+  assert.equal(getGoogleSession(), null);
+  assert.equal(getCloudAccount(), null);
+  assert.equal(forgotten, 1);
+  assert.equal(requests, 0);
+});
+
+test('cloud capability expiry clears account state without silently extending Google authorization', async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  pages(); const cloud = mirrorCloud();
+  let silentRequests = 0;
+  window.google.accounts.oauth2.initTokenClient = () => { silentRequests++; throw new Error('No automatic OAuth refresh for local capabilities.'); };
+  const { account: instance } = account();
+  await instance.initialize();
+  context.mock.timers.tick(2_000_000_000);
+  assert.equal(instance.state.status, 'signed-in');
+  context.mock.timers.tick(cloud.expiresAt - Date.now() - 60_000);
+  assert.equal(instance.state.status, 'signed-out');
+  assert.equal(getCloudAccount(), null);
+  assert.equal(getGoogleSession(), null);
+  assert.equal(silentRequests, 0);
+  context.mock.timers.reset();
+});
+
+test('logging out during private Drive discovery cannot restore a late cloud capability', async () => {
+  pages(); immediateGoogle();
+  let release;
+  globalThis.fetch = async url => {
+    if (new URL(String(url)).pathname === '/drive/v3/files') return new Promise(resolve => { release = resolve; });
+    return cloudDriveResponse(url);
+  };
+  const { account: instance } = account();
+  const login = instance.signIn();
+  const rejected = assert.rejects(login, /cancelado|cambiado/);
+  for (let turn = 0; turn < 20 && !release; turn++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(release);
+  instance.signOut();
+  release(new Response(JSON.stringify({ files: [realmMetadata] })));
+  await rejected;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(instance.state.status, 'signed-out');
+  assert.equal(getCloudAccount(), null);
+  assert.equal(getGoogleSession(), null);
 });

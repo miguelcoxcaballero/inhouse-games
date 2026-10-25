@@ -72,3 +72,115 @@ test('saved hosts, trusted viewers and host identity are isolated by Google acco
   forgetTrustedHost('c'.repeat(32));
   localStorage.removeItem(GOOGLE_SESSION_KEY);
 });
+
+function signIn(id) {
+  localStorage.setItem(GOOGLE_SESSION_KEY, JSON.stringify({
+    accessToken: `test-access-${id}`, expiresAt: Date.now() + 3_600_000,
+    profile: { id, name: id, email: `${id}@example.test`, photo: '' },
+  }));
+}
+
+function accountFixture(t, id) {
+  const previous = localStorage.getItem(GOOGLE_SESSION_KEY);
+  t.after(() => { if (previous === null) localStorage.removeItem(GOOGLE_SESSION_KEY); else localStorage.setItem(GOOGLE_SESSION_KEY, previous); });
+  signIn(id);
+  return `inhouse.hostIdentity.v1:${encodeURIComponent(id)}`;
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+test('concurrent first identities share one device and each signature authenticates its own nonce', async (t) => {
+  const storageKey = accountFixture(t, 'concurrent-first-identity');
+  const nonces = Array.from({ length: 8 }, (_, index) => `parallel-challenge-${index}`);
+  const identities = await Promise.all(nonces.map((nonce) => identityForNonce(nonce)));
+  const first = identities[0];
+  const key = await crypto.subtle.importKey('jwk', first.identity.publicKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  const saved = JSON.parse(localStorage.getItem(storageKey));
+  assert.deepEqual(saved.publicKey, first.identity.publicKey);
+  for (const [index, identity] of identities.entries()) {
+    assert.equal(identity.deviceId, first.deviceId);
+    assert.deepEqual(identity.identity.publicKey, first.identity.publicKey);
+    const signature = Buffer.from(identity.identity.signature, 'base64url');
+    assert.equal(await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, signature, new TextEncoder().encode(nonces[index])), true);
+    assert.equal(await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, signature, new TextEncoder().encode(nonces[(index + 1) % nonces.length])), false);
+    assert.equal('d' in identity.identity.publicKey, false);
+  }
+});
+
+test('a pending identity from a changed account cannot write or replace the new account identity', async (t) => {
+  const oldStorageKey = accountFixture(t, 'pending-old-account');
+  const started = deferred(), gate = deferred();
+  const generateKey = crypto.subtle.generateKey;
+  let calls = 0;
+  crypto.subtle.generateKey = async function (...args) {
+    const result = await generateKey.apply(this, args);
+    if (++calls === 1) { started.resolve(); await gate.promise; }
+    return result;
+  };
+  t.after(() => { gate.resolve(); crypto.subtle.generateKey = generateKey; });
+  const canceled = assert.rejects(identityForNonce('old-account-challenge'), /cuenta/);
+  await started.promise;
+  signIn('pending-new-account');
+  const fresh = await identityForNonce('new-account-challenge');
+  const newStorageKey = 'inhouse.hostIdentity.v1:pending-new-account';
+  const saved = localStorage.getItem(newStorageKey);
+  gate.resolve();
+  await canceled;
+  assert.equal(localStorage.getItem(oldStorageKey), null);
+  assert.equal(localStorage.getItem(newStorageKey), saved);
+  assert.equal((await identityForNonce('new-account-again')).deviceId, fresh.deviceId);
+});
+
+test('revoking during first generation cancels old work without evicting a newer shared initialization', async (t) => {
+  const storageKey = accountFixture(t, 'pending-revoked-generation');
+  const firstStarted = deferred(), secondStarted = deferred();
+  const firstGate = deferred(), secondGate = deferred();
+  const generateKey = crypto.subtle.generateKey;
+  let calls = 0;
+  crypto.subtle.generateKey = async function (...args) {
+    const index = ++calls;
+    const result = await generateKey.apply(this, args);
+    if (index === 1) { firstStarted.resolve(); await firstGate.promise; }
+    if (index === 2) { secondStarted.resolve(); await secondGate.promise; }
+    return result;
+  };
+  t.after(() => { firstGate.resolve(); secondGate.resolve(); crypto.subtle.generateKey = generateKey; });
+  const revoked = assert.rejects(identityForNonce('before-revocation'), /cuenta/);
+  await firstStarted.promise;
+  clearTrustedDevices();
+  const freshOne = identityForNonce('after-revocation-one');
+  await secondStarted.promise;
+  firstGate.resolve();
+  await revoked;
+  assert.equal(localStorage.getItem(storageKey), null);
+  const freshTwo = identityForNonce('after-revocation-two');
+  secondGate.resolve();
+  const [one, two] = await Promise.all([freshOne, freshTwo]);
+  assert.equal(one.deviceId, two.deviceId);
+  assert.deepEqual(one.identity.publicKey, two.identity.publicKey);
+  assert.deepEqual(JSON.parse(localStorage.getItem(storageKey)).publicKey, one.identity.publicKey);
+});
+
+test('an account change during signing cannot return an already stored identity from the old scope', async (t) => {
+  accountFixture(t, 'pending-signature-account');
+  await identityForNonce('initial-identity');
+  const started = deferred(), gate = deferred();
+  const sign = crypto.subtle.sign;
+  crypto.subtle.sign = async function (...args) {
+    const result = await sign.apply(this, args);
+    started.resolve();
+    await gate.promise;
+    return result;
+  };
+  t.after(() => { gate.resolve(); crypto.subtle.sign = sign; });
+  const canceled = assert.rejects(identityForNonce('signature-in-progress'), /cuenta/);
+  await started.promise;
+  signIn('changed-during-signature');
+  gate.resolve();
+  await canceled;
+  assert.equal(localStorage.getItem('inhouse.hostIdentity.v1:changed-during-signature'), null);
+});

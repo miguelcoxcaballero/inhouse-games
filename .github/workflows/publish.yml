@@ -134,7 +134,7 @@ jobs:
           touch dist/.nojekyll
         env:
           VITE_BASE_PATH: /inhouse-games/
-          VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL }}
+          VITE_SIGNALING_URL: ''
       - name: Publish the current website branch
         if: steps.current.outputs.publish == 'true'
         uses: peaceiris/actions-gh-pages@v4
