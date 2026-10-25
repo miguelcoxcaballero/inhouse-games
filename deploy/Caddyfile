@@ -1,0 +1,5 @@
+# LINK_DOMAIN must point to your server. Run Node on 127.0.0.1:8080.
+{$LINK_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8080
+}

@@ -1,0 +1,165 @@
+name: Verify and publish inhouse link
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inhouse-link-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify web, signaling and real WebRTC
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Install the distribution's signed coturn package
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y coturn
+      - name: Install the matching Playwright Chromium
+        run: |
+          npx --no-install playwright install --with-deps chromium
+          node -e "console.log('CHROMIUM_PATH=' + require('@playwright/test').chromium.executablePath())" >> "$GITHUB_ENV"
+      - run: npm run typecheck
+      - run: npm test
+      - run: node --test scripts/release-manifest.test.mjs
+      - run: npm run test:e2e
+      - run: npm run build
+      - name: Retain failing browser evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inhouse-link-browser-evidence
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+
+  windows:
+    name: Build the Windows portable app
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:windows
+        env:
+          VITE_BASE_PATH: /
+      - name: Compile the actual Windows input helper without injecting input
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File desktop/input-smoke.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inhouse-link-windows
+          path: |
+            artifacts/Inhouse-Link-Windows.exe
+            artifacts/Inhouse-Link-Windows.exe.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish verified downloads and the website
+    if: github.ref == 'refs/heads/main'
+    needs: [verify, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          name: inhouse-link-windows
+          path: artifacts
+      - run: npm ci
+      - name: Build the independent web service package at its root
+        run: |
+          npm run build
+          python3 scripts/package-web.py
+          python3 scripts/package-source.py
+        env:
+          VITE_BASE_PATH: /
+      - name: Publish an immutable preview release and verify every public asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="v${version}-${GITHUB_SHA:0:7}"
+          verified_dir="$RUNNER_TEMP/inhouse-release-verified"
+          mkdir -p "$verified_dir"
+          expected_args=()
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            target=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)
+            draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            if [ "$target" != "$GITHUB_SHA" ] || [ "$draft" != false ]; then
+              echo "An existing release has a different target or is an incomplete draft; it will not be overwritten."
+              exit 1
+            fi
+            echo "Reusing the original published release without replacing its bytes."
+          else
+            notes="$RUNNER_TEMP/inhouse-release-notes.md"
+            printf '%s\n' 'Google login and shared downloads.' > "$notes"
+            gh release create "$tag" \
+              artifacts/Inhouse-Link-Windows.exe artifacts/Inhouse-Link-Windows.exe.sha256 \
+              artifacts/Inhouse-Link-Web.zip artifacts/Inhouse-Link-Web.zip.sha256 \
+              artifacts/Inhouse-Link-Source.zip artifacts/Inhouse-Link-Source.zip.sha256 \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "inhouse link ${version}" --notes-file "$notes" --prerelease --latest=false
+            expected_args=(--expected-directory artifacts)
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'Inhouse-Link-Windows.exe*' --pattern 'Inhouse-Link-Web.zip*' --pattern 'Inhouse-Link-Source.zip*' \
+            --dir "$verified_dir"
+          published_at=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)
+          node scripts/release-manifest.mjs \
+            --version "$version" --tag "$tag" --published-at "$published_at" \
+            --repository "$GITHUB_REPOSITORY" --assets-directory "$verified_dir" \
+            --output public/release.json "${expected_args[@]}"
+      - name: Build the website under the GitHub Pages project path
+        run: |
+          npm run build
+          touch dist/.nojekyll
+          test -s dist/index.html
+          test -s dist/release.json
+        env:
+          VITE_BASE_PATH: /inhouse-games/
+          VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL }}
+      - name: Publish the same Pages branch pattern as Inhouse Notes and Read
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ github.token }}
+          publish_dir: dist
+          publish_branch: gh-pages
+          keep_files: true
+          force_orphan: false
+      - name: Confirm the public website and exact download manifest
+        run: node scripts/release-check.mjs --site "$PUBLIC_SITE_URL" --manifest public/release.json
+        env:
+          PUBLIC_SITE_URL: ${{ vars.INHOUSE_LINK_SITE_URL || 'https://miguelcoxcaballero.github.io/inhouse-games/' }}
