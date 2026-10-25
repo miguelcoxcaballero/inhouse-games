@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy and verify the public website
-    runs-on: windows-latest
+    runs-on: macos-15
     timeout-minutes: 10
     defaults:
       run:
@@ -64,26 +64,11 @@ jobs:
             fi
           fi
       - uses: actions/configure-pages@v5
-      - name: Package only the public website files
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $payload = Join-Path $env:RUNNER_TEMP 'inhouse-public-pages'
-          New-Item -ItemType Directory -Force -Path $payload | Out-Null
-          Get-ChildItem -Force $env:GITHUB_WORKSPACE |
-            Where-Object { $_.Name -notin @('.git', '.github') } |
-            Copy-Item -Destination $payload -Recurse -Force
-          $archive = Join-Path $env:RUNNER_TEMP 'artifact.tar'
-          $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-          & $tar --format=ustar -cf $archive -C $payload .
-          if ($LASTEXITCODE -ne 0) { throw 'The public Pages archive could not be created.' }
-          if (-not (Test-Path $archive)) { throw 'The Pages archive is missing.' }
-      - uses: actions/upload-artifact@v4
+      - name: Package and upload only the public website files
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: github-pages
-          path: ${{ runner.temp }}/artifact.tar
+          path: .
           retention-days: 1
-          compression-level: 0
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
@@ -116,11 +101,11 @@ jobs:
                 if (!response.ok) throw new Error('The public download manifest is missing.');
                 const actual = await response.json();
                 if (actual.tag !== expected.tag || actual.publishedAt !== expected.publishedAt) throw new Error('The CDN still serves an older download manifest.');
-                for (const key of ['web', 'source']) {
+                for (const key of ['windows', 'web', 'source']) {
                   const file = actual.downloads?.[key];
                   if (!file) continue;
                   if (file.sha256 !== expected.downloads?.[key]?.sha256 || file.url !== expected.downloads?.[key]?.url) throw new Error('The public download metadata does not match the deployment.');
-                  const download = await fetch(file.url, { signal: AbortSignal.timeout(30000) });
+                  const download = await fetch(file.url, { signal: AbortSignal.timeout(120000) });
                   if (!download.ok) throw new Error(`The ${key} download returned HTTP ${download.status}.`);
                   const bytes = Buffer.from(await download.arrayBuffer());
                   if (bytes.length !== file.size || createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error(`The ${key} download failed its checksum.`);
