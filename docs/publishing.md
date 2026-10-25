@@ -2,11 +2,13 @@
 
 La web se publica con `deploy-website.yml`, de forma independiente del ejecutable. `publish.yml` verifica y publica las descargas completas. Ambos construyen la rama `gh-pages`; `deploy-static.yml` despliega esa rama mediante las acciones oficiales de Pages y comprueba la página y los archivos públicos. El despliegue y los trabajos de compilación Linux usan el ejecutor estándar Ubuntu 24.04. Las nuevas ejecuciones de publicación cancelan las anteriores que hayan quedado obsoletas. Los cambios exclusivos de documentación o del workflow estático no reconstruyen el ejecutable.
 
+Los flujos de publicación terminan al solicitar la ejecución de `deploy-static.yml` y liberan su runner. El despliegue queda verificado cuando ese workflow estático termina correctamente: después de publicar Pages comprueba HTTP 200, los archivos de la aplicación y los hashes de las descargas disponibles. El éxito del flujo que lo solicita indica que la publicación está encolada.
+
 1. Verifica tipos, pruebas Node, navegador y transmisión real mediante coturn.
 2. Compila la aplicación portable en un runner Windows y compila también el auxiliar C# mediante PowerShell, sin inyectar entradas.
 3. Crea una release de versión exacta `v<versión>-<commit corto>` con ejecutable, paquete web/servidor, código fuente y SHA-256. No reemplaza los bytes de una publicación existente.
 4. Descarga y verifica los artefactos publicados antes de generar `release.json` con enlaces exactos, tamaño, hash y fecha reales.
-5. Construye la web con base `/inhouse-games/`, publica `gh-pages` y comprueba la web y el manifiesto públicos.
+5. Construye la web con base `/inhouse-games/`, publica `gh-pages` y solicita el despliegue y la comprobación públicos mediante `deploy-static.yml`.
 
 El ejecutable conserva los idiomas español e inglés y usa compresión máxima. Si su tamaño verificado no supera 100 MiB, puede servirse directamente desde `gh-pages`, con su SHA-256; nunca se añade el binario a `main`. Los flujos también publican los paquetes completos en Releases. La fuente completa y los scripts de compilación están en `main`.
 
@@ -15,7 +17,8 @@ GitHub Pages usa **GitHub Actions** como modo de despliegue. Las dos publicacion
 Variables opcionales del repositorio:
 
 - `VITE_SIGNALING_URL`: URL HTTPS del servicio Node/WebSocket desplegado. Si falta, se configura desde el cliente. Nunca contiene credenciales.
-- `INHOUSE_LINK_SITE_URL`: URL pública distinta para comprobar el despliegue; por defecto se comprueba `https://miguelcoxcaballero.github.io/inhouse-games/`.
+
+El script independiente `scripts/check-website.mjs` permite repetir la comprobación manualmente; acepta `PUBLIC_SITE_URL` y comprueba por defecto `https://miguelcoxcaballero.github.io/inhouse-games/`.
 
 GitHub Pages sirve producto, descargas, cliente y broker de login. **No ejecuta el servidor Node/WebSocket ni coturn.** El servicio de conexión se despliega aparte con los pasos de [deployment.md](deployment.md).
 

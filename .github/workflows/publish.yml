@@ -149,8 +149,3 @@ jobs:
         run: gh workflow run deploy-static.yml --ref main --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Verify the public website and its actual available downloads
-        if: steps.current.outputs.publish == 'true'
-        run: node scripts/check-website.mjs
-        env:
-          PUBLIC_SITE_URL: ${{ vars.INHOUSE_LINK_SITE_URL || 'https://miguelcoxcaballero.github.io/inhouse-games/' }}
