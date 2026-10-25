@@ -10,7 +10,7 @@ La web se publica con `deploy-website.yml`, de forma independiente del ejecutabl
 
 El ejecutable conserva los idiomas español e inglés y usa compresión máxima. Si su tamaño verificado no supera 100 MiB, puede servirse directamente desde `gh-pages`, con su SHA-256; nunca se añade el binario a `main`. Los flujos también publican los paquetes completos en Releases. La fuente completa y los scripts de compilación están en `main`.
 
-GitHub Pages usa **GitHub Actions** como modo de despliegue. El flujo estático configura el sitio existente para ese modo; su código se ejecuta desde gh-pages. Actions necesita permisos de escritura de contenido para la rama de publicación y Releases. El workflow usa su `GITHUB_TOKEN` automático; no se añade un token personal al proyecto.
+GitHub Pages usa **GitHub Actions** como modo de despliegue. Las dos publicaciones lanzan explícitamente `deploy-static.yml` con `--ref main`; ese workflow obtiene los archivos públicos mediante checkout de `gh-pages` y configura el sitio existente para ese modo. La fuente del workflow se mantiene en `main`, sin copiarla a la rama de publicación. Actions necesita permisos de escritura de contenido para la rama de publicación y Releases. El workflow usa su `GITHUB_TOKEN` automático; no se añade un token personal al proyecto.
 
 Variables opcionales del repositorio:
 

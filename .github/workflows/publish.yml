@@ -146,7 +146,7 @@ jobs:
           force_orphan: false
       - name: Deploy the static branch without waiting for another push event
         if: steps.current.outputs.publish == 'true'
-        run: gh workflow run deploy-static.yml --ref gh-pages --repo "$GITHUB_REPOSITORY"
+        run: gh workflow run deploy-static.yml --ref main --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Verify the public website and its actual available downloads

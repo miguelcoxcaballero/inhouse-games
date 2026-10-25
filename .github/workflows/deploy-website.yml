@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - name: Deploy the static branch with its pinned Pages workflow
         if: steps.current.outputs.publish == 'true'
-        run: gh workflow run deploy-static.yml --ref gh-pages --repo "$GITHUB_REPOSITORY"
+        run: gh workflow run deploy-static.yml --ref main --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Verify the actual public website and available download bytes
