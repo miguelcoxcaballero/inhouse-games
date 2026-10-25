@@ -1,22 +1,22 @@
 {
   "version": "0.2.0",
-  "tag": "v0.2.0-eece62a",
-  "publishedAt": "2026-10-25T20:43:41.000Z",
+  "tag": "v0.2.0-196dd03",
+  "publishedAt": "2026-10-25T21:43:20.000Z",
   "downloads": {
     "windows": {
-      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-eece62a/Inhouse-Link-Windows.exe",
-      "sha256": "cd338504ff79adae7274553fb11ffcca6a86cfc33649e50c5f11c54a60c08396",
-      "size": 104220999
+      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-196dd03/Inhouse-Link-Windows.exe",
+      "sha256": "78a0bbaf13e1bf0a065810005cad8119a25dff23b2d19144c0bd062db0540e03",
+      "size": 104221002
     },
     "web": {
-      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-eece62a/Inhouse-Link-Web.zip",
-      "sha256": "c375ef7daaf0110b1e4b1e538db95d82f71c4f840193a035c12d3a61b0688866",
+      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-196dd03/Inhouse-Link-Web.zip",
+      "sha256": "d00d9d05b49cb74ee3cf02fb7353caee84a1ed7e45316d5cc69ce39230e1c2c4",
       "size": 215558
     },
     "source": {
-      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-eece62a/Inhouse-Link-Source.zip",
-      "sha256": "f70f00990595107b3008ce03874e49793ab543de073a893fd8776bd162a82223",
-      "size": 338267
+      "url": "https://github.com/miguelcoxcaballero/inhouse-games/releases/download/v0.2.0-196dd03/Inhouse-Link-Source.zip",
+      "sha256": "c6faa765f38cb17532031e225ff2c4a8cf7da5879223ef16cc63d310e60d697b",
+      "size": 338302
     }
   }
 }
