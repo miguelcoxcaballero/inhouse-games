@@ -34,6 +34,10 @@ No se emula un mando virtual. Los juegos con entrada protegida o software antitr
 
 ## Empaquetado
 
+`npm run build:windows` crea el portable `artifacts/Inhouse-Link-Windows.exe`. `npm run build:installer` crea un instalador NSIS independiente, `artifacts/Inhouse-Link-Setup-0.2.0.exe`, y su SHA-256. El asistente instala para el usuario actual, permite elegir carpeta y crea accesos en escritorio/menú Inicio y una entrada de desinstalación de Windows. No solicita elevación; al desinstalar conserva las preferencias y vinculaciones del usuario. Ambos paquetes contienen la misma aplicación x64.
+
+En Linux, `scripts/build-installer.mjs` usa el parser `UninstallerReader` incluido en electron-builder 26.18 para extraer el desinstalador intermedio generado por NSIS, igual que su implementación para macOS. Así no ejecuta un programa Windows durante el empaquetado ni necesita Wine. En Windows utiliza el proceso normal de electron-builder. La verificación posterior exige el paquete x64 y el desinstalador completos y comprueba sus CRC y los hashes de la aplicación incluida antes de emitir el SHA-256.
+
 El paquete debe conservar `asarUnpack: ["desktop/native/**/*"]`: PowerShell necesita un archivo real fuera de `app.asar`. El artefacto portable es x64. El ejecutable no se presenta como firmado si no se ha aplicado un certificado de firma.
 
 ## Validación en Windows pendiente de hardware

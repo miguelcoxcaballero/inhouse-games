@@ -18,6 +18,7 @@
     "test": "node --test tests/*.test.mjs desktop/*.test.cjs",
     "test:e2e": "playwright test",
     "build:windows": "npm run build && electron-builder --win portable --x64 --publish never && node scripts/stage-windows.mjs",
+    "build:installer": "npm run build && node scripts/build-installer.mjs && node scripts/stage-installer.mjs",
     "build:windows:dir": "npm run build && electron-builder --win --x64 --dir --publish never",
     "check": "npm run typecheck && npm test && npm run test:e2e && npm run build"
   },
@@ -74,6 +75,20 @@
     },
     "portable": {
       "requestExecutionLevel": "user"
+    },
+    "nsis": {
+      "artifactName": "Inhouse-Link-Setup-${version}.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "differentialPackage": false,
+      "packElevateHelper": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Inhouse Link",
+      "uninstallDisplayName": "Inhouse Link",
+      "deleteAppDataOnUninstall": false
     }
   },
   "engines": {
