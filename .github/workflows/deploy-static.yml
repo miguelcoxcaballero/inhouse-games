@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy and verify the public website
-    runs-on: macos-15
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     defaults:
       run:
