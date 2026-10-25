@@ -10,7 +10,7 @@ from pathlib import Path
 SOURCE_DIRECTORIES = ('.github', 'src', 'desktop', 'server', 'scripts', 'tests', 'docs', 'deploy', 'public', 'vendor')
 IGNORED_PARTS = {'.git', 'node_modules', 'dist', 'artifacts', 'downloads', '__pycache__', '.pytest_cache', '.cache', 'test-results', 'playwright-report'}
 IGNORED_SUFFIXES = {'.exe', '.apk', '.zip', '.blockmap', '.log', '.pyc'}
-ROOT_FILES = ('README.md', 'AGENTS.md', 'IMPLEMENTATION.md', '.gitignore', '.gitattributes', '.env.example', 'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts', 'playwright.config.ts')
+ROOT_FILES = ('README.md', 'AGENTS.md', 'IMPLEMENTATION.md', '.gitignore', '.gitattributes', '.env.example', 'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts', 'playwright.config.ts', 'render.yaml')
 
 
 def package(root: Path, output: Path) -> int:

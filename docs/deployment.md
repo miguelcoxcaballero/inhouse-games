@@ -4,7 +4,7 @@ El `.exe` y la web necesitan el mismo servidor de señalización alcanzable. El 
 
 ## Sin VPS: servicio gestionado en Render
 
-El [Blueprint incluido](../render.yaml) prepara un servicio Node con HTTPS, WebSocket, autenticación Google obligatoria y STUN público de Google. Puedes desplegarlo en tu propia cuenta de Render:
+El [Blueprint incluido](https://github.com/miguelcoxcaballero/inhouse-games/blob/main/render.yaml) prepara un servicio Node con HTTPS, WebSocket, autenticación Google obligatoria y STUN público de Google. Puedes desplegarlo en tu propia cuenta de Render:
 
 [Desplegar el servicio de Inhouse Link en Render](https://render.com/deploy?repo=https://github.com/miguelcoxcaballero/inhouse-games)
 
