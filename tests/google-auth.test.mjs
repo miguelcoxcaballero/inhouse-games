@@ -38,6 +38,17 @@ test('a token for another OAuth client is rejected before reading profile metada
   assert.equal(f.calls.length, 1);
 });
 
+test('existing Notes full-Drive grants are accepted only for the exact shared OAuth client', async () => {
+  const scope = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.profile';
+  const notes = fakeProvider({ info: { ...VALID_INFO, scope } });
+  assert.equal((await notes.verify(TOKEN)).id, PROFILE.user.permissionId);
+  assert.equal(notes.calls.length, 2);
+  assert.match(notes.calls[1].url, /\/drive\/v3\/about\?/);
+  const wrongClient = fakeProvider({ info: { ...VALID_INFO, scope, aud: 'another-client.apps.googleusercontent.com' } });
+  await assert.rejects(wrongClient.verify(TOKEN), (error) => error instanceof GoogleAuthError && error.status === 401);
+  assert.equal(wrongClient.calls.length, 1);
+});
+
 test('expired, missing-scope and invalid provider identities fail closed', async () => {
   for (const override of [
     { info: { ...VALID_INFO, expires_in: 0 } },

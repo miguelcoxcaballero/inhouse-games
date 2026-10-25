@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 export const DEFAULT_GOOGLE_CLIENT_ID = '435784295430-cmug30o42f1vu4ijgor9sjb0ro4oo37o.apps.googleusercontent.com';
 const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 const TOKEN_INFO_URL = 'https://oauth2.googleapis.com/tokeninfo';
 const DRIVE_USER_URL = 'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,photoLink,permissionId)';
 
@@ -63,8 +64,8 @@ export function createGoogleTokenVerifier(options = {}) {
     const seconds = Number(info.expires_in);
     if (!Number.isFinite(seconds) || seconds <= 0) throw new GoogleAuthError();
     const scopes = typeof info.scope === 'string' ? info.scope.split(/\s+/) : [];
-    if (!scopes.includes(DRIVE_FILE_SCOPE)) {
-      throw new GoogleAuthError('La sesión de Google no incluye el permiso drive.file utilizado por Inhouse.');
+    if (!scopes.includes(DRIVE_FILE_SCOPE) && !scopes.includes(DRIVE_SCOPE)) {
+      throw new GoogleAuthError('La sesión de Google no incluye el permiso de Drive utilizado por Inhouse.');
     }
     const about = await requestJson(DRIVE_USER_URL, { method: 'GET', headers: { authorization }, signal });
     const user = about?.user;

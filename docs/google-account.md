@@ -2,7 +2,7 @@
 
 Link utiliza el mismo **Google Identity Services OAuth2** y el mismo cliente web público que Notes y Read: `435784295430-cmug30o42f1vu4ijgor9sjb0ro4oo37o.apps.googleusercontent.com`. Es un identificador público, no una credencial secreta.
 
-El cliente carga `https://accounts.google.com/gsi/client`, crea `google.accounts.oauth2.initTokenClient` y solicita acceso directamente desde el clic. Como Read, pide `https://www.googleapis.com/auth/drive.file` y obtiene el perfil de `https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,photoLink,permissionId)`. Link no lee ni escribe documentos de Drive y no añade el permiso Calendar de Notes.
+El cliente carga `https://accounts.google.com/gsi/client`, crea `google.accounts.oauth2.initTokenClient` y solicita acceso directamente desde el clic. Como Read, pide `https://www.googleapis.com/auth/drive.file` y obtiene el perfil de `https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,photoLink,permissionId)`. Link no lee ni escribe documentos de Drive y no añade el permiso Calendar de Notes. Si la misma cuenta ya concedió a Notes el permiso completo de Drive, ese permiso existente también se reconoce como válido; Link sigue solicitando únicamente drive.file.
 
 Esto reutiliza el proveedor y flujo de cuenta, no una sesión mágica compartida entre aplicaciones: cada una conserva sus propias claves. Link usa `inhouse.link.google-session.v1`. Un avatar o email guardados no son prueba de autenticación.
 

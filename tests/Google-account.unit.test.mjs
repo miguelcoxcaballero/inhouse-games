@@ -135,6 +135,24 @@ test('missing requested Drive scope does not create a fake signed-in account', a
   assert.equal(getGoogleSession(), null);
 });
 
+test('an existing full-Drive grant from Notes is accepted while Link still requests only drive.file', async () => {
+  let configuration;
+  window.google.accounts.oauth2.initTokenClient = options => {
+    configuration = options;
+    return { requestAccessToken() {
+      options.callback({ access_token: 'synthetic-notes-existing-grant', expires_in: 3600,
+        scope: 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/calendar.events' });
+    } };
+  };
+  const { account: instance } = account();
+  await instance.signIn();
+  assert.equal(configuration.client_id, GOOGLE_CLIENT_ID);
+  assert.equal(configuration.scope, 'https://www.googleapis.com/auth/drive.file');
+  assert.equal(configuration.include_granted_scopes, true);
+  assert.equal(instance.state.status, 'signed-in');
+  assert.equal(getGoogleSession().accessToken, 'synthetic-notes-existing-grant');
+});
+
 test('signing out while the Google popup is pending prevents its late callback from restoring access', async () => {
   let callback;
   window.google.accounts.oauth2.initTokenClient = options => { callback = options.callback; return { requestAccessToken() {} }; };

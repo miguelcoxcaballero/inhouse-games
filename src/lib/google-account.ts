@@ -371,7 +371,10 @@ export class GoogleAccount {
             if (received) return;
             received = true;
             if (response.error) { const error = new Error(response.error_description || 'Google no autorizó la conexión.'); this.rejectSession(error); complete(error); return; }
-            if (response.scope && !response.scope.split(/\s+/).includes(GOOGLE_SCOPE)) {
+            const granted = response.scope?.split(/\s+/) ?? [];
+            // Notes may already have granted full Drive to this shared client.
+            // That existing grant covers drive.file; Link still requests only file.
+            if (response.scope && !granted.includes(GOOGLE_SCOPE) && !granted.includes('https://www.googleapis.com/auth/drive')) {
               const error = new Error('Google no concedió el permiso de cuenta solicitado.'); this.rejectSession(error); complete(error); return;
             }
             const seconds = Number(response.expires_in);

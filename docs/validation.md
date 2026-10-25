@@ -4,7 +4,7 @@ Validado en el entorno cloud Linux el 25 de octubre de 2026. Los resultados desc
 
 | Comprobación | Resultado |
 |---|---|
-| `npm test` | **73 aprobadas**, 0 fallidas, 0 omitidas. |
+| `npm test` | **75 aprobadas**, 0 fallidas, 0 omitidas. |
 | `npm run typecheck` | Aprobado. |
 | `npm run test:e2e -- --output=/tmp/inhouse-v02-final` | **22 aprobadas**, 0 fallidas, 0 omitidas. |
 | Verificación del manifiesto de publicación | **4 aprobadas**, 0 fallidas. |
