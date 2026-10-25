@@ -1,6 +1,6 @@
 # main, descargas y web del cliente
 
-La web se publica con `deploy-website.yml`, de forma independiente del ejecutable. `publish.yml` verifica y publica las descargas completas. Ambos construyen la rama `gh-pages`; `deploy-static.yml` despliega esa rama mediante las acciones oficiales de Pages y comprueba la página y los archivos públicos. El despliegue estático usa el contenedor ligero `ubuntu-slim`; los trabajos de compilación Linux usan Ubuntu 24.04.
+La web se publica con `deploy-website.yml`, de forma independiente del ejecutable. `publish.yml` verifica y publica las descargas completas. Ambos construyen la rama `gh-pages`; `deploy-static.yml` despliega esa rama mediante las acciones oficiales de Pages y comprueba la página y los archivos públicos. El despliegue y los trabajos de compilación Linux usan el ejecutor estándar Ubuntu 24.04. Las nuevas ejecuciones de publicación cancelan las anteriores que hayan quedado obsoletas. Los cambios exclusivos de documentación o del workflow estático no reconstruyen el ejecutable.
 
 1. Verifica tipos, pruebas Node, navegador y transmisión real mediante coturn.
 2. Compila la aplicación portable en un runner Windows y compila también el auxiliar C# mediante PowerShell, sin inyectar entradas.

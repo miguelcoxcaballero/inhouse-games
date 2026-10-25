@@ -3,6 +3,9 @@ name: Deploy the Inhouse website
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.github/workflows/deploy-static.yml'
   workflow_dispatch:
 
 permissions:

@@ -3,6 +3,10 @@ name: Verify and publish inhouse link
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.github/workflows/deploy-static.yml'
+      - '.github/workflows/deploy-website.yml'
   workflow_dispatch:
 
 permissions:
@@ -10,7 +14,7 @@ permissions:
 
 concurrency:
   group: inhouse-link-release-v2-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   verify:
