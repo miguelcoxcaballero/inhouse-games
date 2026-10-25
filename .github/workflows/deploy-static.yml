@@ -18,8 +18,11 @@ concurrency:
 jobs:
   deploy:
     name: Deploy and verify the public website
-    runs-on: ubuntu-24.04
+    runs-on: windows-latest
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -61,9 +64,26 @@ jobs:
             fi
           fi
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - name: Package only the public website files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payload = Join-Path $env:RUNNER_TEMP 'inhouse-public-pages'
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          Get-ChildItem -Force $env:GITHUB_WORKSPACE |
+            Where-Object { $_.Name -notin @('.git', '.github') } |
+            Copy-Item -Destination $payload -Recurse -Force
+          $archive = Join-Path $env:RUNNER_TEMP 'artifact.tar'
+          $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+          & $tar --format=ustar -cf $archive -C $payload .
+          if ($LASTEXITCODE -ne 0) { throw 'The public Pages archive could not be created.' }
+          if (-not (Test-Path $archive)) { throw 'The Pages archive is missing.' }
+      - uses: actions/upload-artifact@v4
         with:
-          path: .
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          compression-level: 0
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
