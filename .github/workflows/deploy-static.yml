@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy and verify the public website
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
