@@ -1,0 +1,27 @@
+# Optional managed signaling service. Deployment requires the owner's Render account.
+# Video/audio remain on WebRTC; this service is not a TURN relay.
+services:
+  - type: web
+    name: inhouse-link-service
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: ELECTRON_SKIP_BINARY_DOWNLOAD
+        value: "1"
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: "1"
+      - key: ALLOWED_ORIGINS
+        value: https://miguelcoxcaballero.github.io
+      - key: STUN_URLS
+        value: stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
+      - key: INHOUSE_SESSION_FILE
+        value: /tmp/inhouse-link/account-sessions.json

@@ -30,6 +30,8 @@ test('a partial catalog accepts only real-shaped static archives on this site or
   const foreign = partial(); foreign.downloads.source.url = 'https://evil.example/source.zip';
   assert.equal(manifestIdentity(foreign, repository), null);
   const executable = partial(); executable.downloads.windows = { ...executable.downloads.source, url: 'https://miguelcoxcaballero.github.io/inhouse-games/downloads/Inhouse-Link-Windows.exe' };
+  assert.deepEqual(manifestIdentity(executable, repository), { version: '0.2.0', tag: 'v0.2.0-ffeb9df' });
+  executable.downloads.windows.size = 100 * 1024 * 1024 + 1;
   assert.equal(manifestIdentity(executable, repository), null);
   const empty = partial(); empty.downloads = {};
   assert.equal(manifestIdentity(empty, repository), null);
@@ -39,11 +41,13 @@ test('retaining static downloads verifies their actual bytes and writes matching
   const directory = await mkdtemp(path.join(os.tmpdir(), 'inhouse-static-'));
   try {
     const manifest = partial();
+    manifest.downloads.windows = { ...manifest.downloads.source, url: 'https://miguelcoxcaballero.github.io/inhouse-games/downloads/Inhouse-Link-Windows.exe' };
     await verifyStaticManifest(manifest, repository, { readAsset: async name => {
-      assert.equal(name, 'Inhouse-Link-Source.zip'); return content;
+      assert.ok(['Inhouse-Link-Source.zip', 'Inhouse-Link-Windows.exe'].includes(name)); return content;
     }, outputDirectory: directory });
     assert.deepEqual(await readFile(path.join(directory, 'Inhouse-Link-Source.zip')), content);
     assert.equal(await readFile(path.join(directory, 'Inhouse-Link-Source.zip.sha256'), 'utf8'), `${checksum}  Inhouse-Link-Source.zip\n`);
+    assert.deepEqual(await readFile(path.join(directory, 'Inhouse-Link-Windows.exe')), content);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 

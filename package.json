@@ -44,6 +44,8 @@
     "productName": "Inhouse Link",
     "executableName": "InhouseLink",
     "asar": true,
+    "electronLanguages": ["es", "en-US"],
+    "compression": "maximum",
     "directories": {
       "output": "artifacts"
     },

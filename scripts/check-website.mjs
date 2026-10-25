@@ -28,7 +28,7 @@ for (let attempt = 0; attempt < 18; attempt++) {
         if (['url', 'sha256', 'size'].some(key => actual.downloads?.[kind]?.[key] !== item[key])) throw new Error(`The public ${kind} download changed.`);
         const url = new URL(item.url);
         if (url.origin === site.origin) {
-          const file = await fetch(url, { signal: AbortSignal.timeout(20000) });
+          const file = await fetch(url, { signal: AbortSignal.timeout(120000) });
           if (!file.ok) throw new Error(`The public ${kind} archive returned ${file.status}.`);
           const bytes = Buffer.from(await file.arrayBuffer());
           if (bytes.length !== item.size || createHash('sha256').update(bytes).digest('hex') !== item.sha256) throw new Error(`The public ${kind} archive has incorrect bytes.`);
@@ -39,5 +39,5 @@ for (let attempt = 0; attempt < 18; attempt++) {
     process.exit(0);
   } catch (error) { last = error.message; if (attempt < 17) await new Promise(resolve => setTimeout(resolve, 10000)); }
 }
-githubAnnotation(`${last} If Pages is not configured, select Settings → Pages → Deploy from a branch → gh-pages / (root).`);
+githubAnnotation(`${last} Check the deploy-static workflow and the existing Settings → Pages → GitHub Actions configuration.`);
 process.exitCode = 1;

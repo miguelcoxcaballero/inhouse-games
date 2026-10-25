@@ -13,6 +13,7 @@ Validado en el entorno cloud Linux el 25 de octubre de 2026. Los resultados desc
 | `npm run build:windows` | Portable Windows generado y descarga web preparada. |
 | Comprobación del payload Windows | PE x64, manifiesto propio, web compilada, señalización y auxiliar nativo fuera de ASAR presentes. |
 | Paquete web independiente | Instalación congelada de dependencias de producción y peticiones funcionales a web, activos, configuración y health aprobadas. |
+| Configuración del servicio gestionado | Compilación y arranque con las variables del Blueprint: web/health 200, CORS de Pages 204, HTTP/WebSocket sin cuenta 401 y origen ajeno 403. No desplegado en Render. |
 | Publicación de configuración/nueva máquina | No ejecutada; instalación y arranque guardados en borrador para revisión. |
 
 ## Alcance de las pruebas

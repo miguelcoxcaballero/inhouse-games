@@ -2,6 +2,24 @@
 
 El `.exe` y la web necesitan el mismo servidor de señalización alcanzable. El vídeo viaja por WebRTC entre equipos o mediante TURN; no lo retransmite el servidor HTTP. Para Murcia–Valencia hacen falta un dominio/servidor y una ruta ICE adecuada a ambos operadores.
 
+## Sin VPS: servicio gestionado en Render
+
+El [Blueprint incluido](../render.yaml) prepara un servicio Node con HTTPS, WebSocket, autenticación Google obligatoria y STUN público de Google. Puedes desplegarlo en tu propia cuenta de Render:
+
+[Desplegar el servicio de Inhouse Link en Render](https://render.com/deploy?repo=https://github.com/miguelcoxcaballero/inhouse-games)
+
+1. Inicia sesión o crea una cuenta en Render, conecta el repositorio y revisa el Blueprint. La configuración solicita el plan **Free**; comprueba sus condiciones y disponibilidad antes de crear el servicio. Este botón no implica que ya exista un despliegue.
+2. Espera a que el servicio aparezca como **Live** y copia su URL HTTPS real de Render. Abre su ruta `/health`: debe devolver `{"ok":true,"version":"0.2.0"}`.
+3. Abre el [cliente de GitHub Pages](https://miguelcoxcaballero.github.io/inhouse-games/#/client), inicia sesión con Google y entra en **Ajustes → Tu servicio de conexión**. Pega la URL HTTPS copiada, deja vacía **Clave del servicio** y guarda. Vuelve a iniciar sesión si se solicita al cambiar de servicio.
+4. Configura esa misma URL en la aplicación Windows del PC anfitrión y en cualquier otro cliente Windows. El acceso Google conserva el cliente OAuth de Notes y Read. Usa Pages como cliente web: el dominio nuevo de Render no se añade automáticamente a los orígenes autorizados de Google.
+5. Comprueba una conexión entre redes siguiendo los pasos de validación de abajo. Un `/health` correcto comprueba el servicio, no la transmisión de pantalla.
+
+Render proporciona `PORT`; el servidor escucha en `0.0.0.0` detrás de su proxy HTTPS. La compilación instala las dependencias de desarrollo necesarias para Vite y omite la descarga del binario de Electron, que este servicio no ejecuta. Los orígenes de Pages y los clientes nativos locales están permitidos por la configuración existente; no se desactiva la autenticación Google ni se exige una clave adicional.
+
+El plan gratuito puede suspender el servicio cuando está inactivo, causar un arranque lento o reiniciar la instancia. Su almacenamiento es efímero: los reinicios o despliegues pueden borrar las sesiones de cuenta guardadas y los códigos de conexión; será necesario iniciar sesión y compartir de nuevo. Para conservar las sesiones necesitas un almacenamiento persistente compatible y ajustar `INHOUSE_SESSION_FILE`; este Blueprint no contrata un disco ni un plan de pago.
+
+STUN ayuda a encontrar una ruta directa, pero **no garantiza conexión bajo CGNAT ni en cualquier red**. El Blueprint no incluye TURN ni inventa credenciales. Si dispones de un relay propio o contratado, añade en el panel privado de Render `TURN_URLS` y `TURN_SECRET`, o `TURN_USERNAME` y `TURN_CREDENTIAL`, según la sección STUN/TURN. No publiques esos secretos como variables `VITE_`. Render aloja la señalización; su servicio web no sustituye un relay TURN.
+
 ## Web y señalización
 
 En un servidor con Node.js22.12 o posterior:

@@ -21,7 +21,8 @@ export function manifestIdentity(value, repository) {
     const releaseUrl = `https://github.com/${repository}/releases/download/${encodeURIComponent(value.tag)}/${name}`;
     const [owner, repo] = repository.split('/');
     const staticUrl = `https://${owner.toLowerCase()}.github.io/${repo}/downloads/${name}`;
-    if ((item.url !== releaseUrl && (kind === 'windows' || item.url !== staticUrl))
+    if ((item.url !== releaseUrl && item.url !== staticUrl)
+      || (item.url === staticUrl && item.size > 100 * 1024 * 1024)
       || !/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.size) || item.size <= 0) return null;
     count++;
   }
@@ -33,7 +34,7 @@ export async function verifyStaticManifest(manifest, repository, { readAsset, ou
   const [owner, repo] = repository.split('/');
   const records = [];
   for (const [kind, item] of Object.entries(manifest.downloads)) {
-    const name = { web: 'Inhouse-Link-Web.zip', source: 'Inhouse-Link-Source.zip' }[kind];
+    const name = { windows: 'Inhouse-Link-Windows.exe', web: 'Inhouse-Link-Web.zip', source: 'Inhouse-Link-Source.zip' }[kind];
     if (!name || item.url !== `https://${owner.toLowerCase()}.github.io/${repo}/downloads/${name}`) throw new Error('Not a static archive manifest.');
     const bytes = await readAsset(name);
     if (!Buffer.isBuffer(bytes) || bytes.length !== item.size || createHash('sha256').update(bytes).digest('hex') !== item.sha256) {
@@ -66,13 +67,18 @@ async function main() {
       const identity = manifestIdentity(existing, repository);
       if (identity) {
         candidates.push(identity.tag);
-        if (Object.keys(existing.downloads).every(kind => ['web', 'source'].includes(kind))) {
+        const [owner, repo] = repository.split('/');
+        if (Object.values(existing.downloads).every(item => item.url.startsWith(`https://${owner.toLowerCase()}.github.io/${repo}/downloads/`))) {
           try {
             const commit = remoteTag(repository, identity.tag);
             if (!commit || !commit.startsWith(identity.tag.slice(-7))) throw new Error('The existing static download catalog has no matching source tag.');
             staticManifest = await verifyStaticManifest(existing, repository, { readAsset: async name => {
-              const file = command('gh', ['api', `repos/${repository}/contents/downloads/${name}?ref=${siteRef}`, '--jq', '.content']);
-              return Buffer.from(file.output.replace(/\s+/g, ''), 'base64');
+              if (!/^[a-f0-9]{40}$/.test(siteRef)) throw new Error('A commit-pinned website is required.');
+              const file = await fetch(`https://raw.githubusercontent.com/${repository}/${siteRef}/downloads/${name}`, { signal: AbortSignal.timeout(120000) });
+              if (!file.ok) throw new Error(`The published download returned HTTP ${file.status}.`);
+              const size = Number(file.headers.get('content-length'));
+              if (size > 100 * 1024 * 1024) throw new Error('The published download exceeds the static file limit.');
+              return Buffer.from(await file.arrayBuffer());
             } });
           } catch (error) { githubAnnotation(error.message, 'warning'); }
         }
@@ -110,7 +116,7 @@ async function main() {
   }
   if (staticManifest) {
     await writeFile('public/release.json', JSON.stringify(staticManifest, null, 2) + '\n');
-    console.log('Preserved the existing, hash-verified web/source downloads. Windows remains unavailable until its real release is published.');
+    console.log('Preserved the existing static downloads after checking their actual bytes and SHA-256.');
     return;
   }
   githubAnnotation('No verified public download release exists yet. Product, Google login and web client will still be deployed; download links will appear after a successful release.', 'warning');
