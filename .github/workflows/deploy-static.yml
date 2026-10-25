@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
   pages: write
   id-token: write
 
@@ -27,6 +28,21 @@ jobs:
         with:
           ref: gh-pages
           persist-credentials: false
+      - name: Cancel obsolete deployment queues
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          legacy_pages=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=gh-pages&per_page=50" --jq '.workflow_runs[] | select(.name == "pages build and deployment" and (.status == "queued" or .status == "in_progress" or .status == "waiting")) | .id')
+          for run_id in $legacy_pages; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel" >/dev/null 2>&1 || true
+          done
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          old_releases=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?branch=main&per_page=50" --jq ".workflow_runs[] | select(.path == \".github/workflows/publish.yml\" and .head_sha != \"$main_sha\" and (.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\")) | .id")
+          for run_id in $old_releases; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel" >/dev/null 2>&1 || true
+          done
       - name: Use Actions to deploy the existing Pages site
         shell: bash
         env:
