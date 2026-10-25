@@ -1,6 +1,6 @@
 # main, descargas y web del cliente
 
-El workflow `.github/workflows/publish.yml` se ejecuta al subir a `main` o al iniciarlo manualmente desde Actions. Usa el mismo patrón de rama `gh-pages` que los proyectos Inhouse Notes y Read.
+La web se publica con `deploy-website.yml`, de forma independiente del ejecutable. `publish.yml` verifica y publica las descargas completas. Ambos construyen la rama `gh-pages`; `deploy-static.yml` despliega esa rama mediante la API oficial de Pages y comprueba la página y los archivos públicos. Los trabajos Linux usan Ubuntu 24.04, evitando la migración variable de ubuntu-latest.
 
 1. Verifica tipos, pruebas Node, navegador y transmisión real mediante coturn.
 2. Compila la aplicación portable en un runner Windows y compila también el auxiliar C# mediante PowerShell, sin inyectar entradas.
@@ -10,7 +10,7 @@ El workflow `.github/workflows/publish.yml` se ejecuta al subir a `main` o al in
 
 El ejecutable supera el límite de un blob Git; se publica como artefacto de Releases en lugar de incluirlo en el historial de `main`. La fuente completa y los scripts de compilación sí están en `main`.
 
-GitHub Pages debe estar habilitado para servir **Deploy from a branch → gh-pages → /(root)**. Actions necesita permisos de escritura de contenido para la rama de publicación y Releases. El workflow usa su `GITHUB_TOKEN` automático; no se añade un token personal al proyecto.
+GitHub Pages usa **GitHub Actions** como modo de despliegue. El flujo estático configura el sitio existente para ese modo; su código se ejecuta desde gh-pages. Actions necesita permisos de escritura de contenido para la rama de publicación y Releases. El workflow usa su `GITHUB_TOKEN` automático; no se añade un token personal al proyecto.
 
 Variables opcionales del repositorio:
 
@@ -18,3 +18,5 @@ Variables opcionales del repositorio:
 - `INHOUSE_LINK_SITE_URL`: URL pública distinta para comprobar el despliegue; por defecto se comprueba `https://miguelcoxcaballero.github.io/inhouse-games/`.
 
 GitHub Pages sirve producto, descargas, cliente y broker de login. **No ejecuta el servidor Node/WebSocket ni coturn.** El servicio de conexión se despliega aparte con los pasos de [deployment.md](deployment.md).
+
+La creación de Releases verifica primero el SHA real de un tag Git inmutable y usa `--verify-tag`, sin pedir al token de Actions que cree una release para un commit ya desplazado de main. Las ejecuciones obsoletas sin tag se omiten. La web conserva los paquetes reales de web y fuentes mientras termina la descarga Windows, sin inventar enlaces ni bloquear toda la página.

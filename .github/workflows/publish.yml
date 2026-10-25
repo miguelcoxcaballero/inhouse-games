@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: inhouse-link-publish-${{ github.ref }}
+  group: inhouse-link-release-v2-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   verify:
     name: Verify web, signaling and real WebRTC
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
           node -e "console.log('CHROMIUM_PATH=' + require('@playwright/test').chromium.executablePath())" >> "$GITHUB_ENV"
       - run: npm run typecheck
       - run: npm test
-      - run: node --test scripts/release-manifest.test.mjs
+      - run: node --test scripts/release-manifest.test.mjs scripts/publication-helpers.test.mjs
       - run: npm run test:e2e -- --reporter=list,github
       - run: npm run build
       - name: Retain failing browser evidence
@@ -80,10 +80,11 @@ jobs:
     name: Publish verified downloads and the website
     if: github.ref == 'refs/heads/main'
     needs: [verify, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,54 +105,34 @@ jobs:
           python3 scripts/package-source.py
         env:
           VITE_BASE_PATH: /
-      - name: Publish an immutable preview release and verify every public asset
-        shell: bash
+      - name: Publish an immutable tagged release and verify public assets
+        id: release
+        run: node scripts/publish-release.mjs
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: Refuse an obsolete website deployment
+        id: current
+        if: steps.release.outputs.published == 'true'
+        shell: bash
         run: |
           set -euo pipefail
-          version=$(node -p "require('./package.json').version")
-          tag="v${version}-${GITHUB_SHA:0:7}"
-          verified_dir="$RUNNER_TEMP/inhouse-release-verified"
-          mkdir -p "$verified_dir"
-          expected_args=()
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            target=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)
-            draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
-            if [ "$target" != "$GITHUB_SHA" ] || [ "$draft" != false ]; then
-              echo "An existing release has a different target or is an incomplete draft; it will not be overwritten."
-              exit 1
-            fi
-            echo "Reusing the original published release without replacing its bytes."
+          current_sha=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$GITHUB_SHA" = "$current_sha" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           else
-            notes="$RUNNER_TEMP/inhouse-release-notes.md"
-            printf '%s\n' 'Google login and shared downloads.' > "$notes"
-            gh release create "$tag" \
-              artifacts/Inhouse-Link-Windows.exe artifacts/Inhouse-Link-Windows.exe.sha256 \
-              artifacts/Inhouse-Link-Web.zip artifacts/Inhouse-Link-Web.zip.sha256 \
-              artifacts/Inhouse-Link-Source.zip artifacts/Inhouse-Link-Source.zip.sha256 \
-              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "inhouse link ${version}" --notes-file "$notes" --prerelease --latest=false
-            expected_args=(--expected-directory artifacts)
+            echo "The immutable release is published; current main will deploy the website."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
           fi
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'Inhouse-Link-Windows.exe*' --pattern 'Inhouse-Link-Web.zip*' --pattern 'Inhouse-Link-Source.zip*' \
-            --dir "$verified_dir"
-          published_at=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)
-          node scripts/release-manifest.mjs \
-            --version "$version" --tag "$tag" --published-at "$published_at" \
-            --repository "$GITHUB_REPOSITORY" --assets-directory "$verified_dir" \
-            --output public/release.json "${expected_args[@]}"
-      - name: Build the website under the GitHub Pages project path
+      - name: Build the website with its verified release catalog
+        if: steps.current.outputs.publish == 'true'
         run: |
           npm run build
           touch dist/.nojekyll
-          test -s dist/index.html
-          test -s dist/release.json
         env:
           VITE_BASE_PATH: /inhouse-games/
           VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL }}
-      - name: Publish the same Pages branch pattern as Inhouse Notes and Read
+      - name: Publish the current website branch
+        if: steps.current.outputs.publish == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ github.token }}
@@ -159,7 +140,13 @@ jobs:
           publish_branch: gh-pages
           keep_files: true
           force_orphan: false
-      - name: Confirm the public website and exact download manifest
-        run: node scripts/release-check.mjs --site "$PUBLIC_SITE_URL" --manifest public/release.json
+      - name: Deploy the static branch without waiting for another push event
+        if: steps.current.outputs.publish == 'true'
+        run: gh workflow run deploy-static.yml --ref gh-pages --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Verify the public website and its actual available downloads
+        if: steps.current.outputs.publish == 'true'
+        run: node scripts/check-website.mjs
         env:
           PUBLIC_SITE_URL: ${{ vars.INHOUSE_LINK_SITE_URL || 'https://miguelcoxcaballero.github.io/inhouse-games/' }}

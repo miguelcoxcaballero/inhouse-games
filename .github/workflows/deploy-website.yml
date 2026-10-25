@@ -1,0 +1,86 @@
+name: Deploy the Inhouse website
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Verify and publish inhouse link]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  actions: write
+
+concurrency:
+  group: inhouse-link-website
+  cancel-in-progress: true
+
+jobs:
+  website:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Retain only actual downloads, verifying hashes before offering them
+        run: node scripts/prepare-website-manifest.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Build the website independently of the Windows release
+        run: |
+          npm run build
+          touch dist/.nojekyll
+        env:
+          VITE_BASE_PATH: /inhouse-games/
+          VITE_SIGNALING_URL: ${{ vars.VITE_SIGNALING_URL }}
+      - name: Refuse an obsolete website deployment
+        id: current
+        shell: bash
+        run: |
+          set -euo pipefail
+          deployed_sha=$(git rev-parse HEAD)
+          current_sha=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$deployed_sha" = "$current_sha" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Main advanced; its current workflow will publish the website."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish the website branch
+        if: steps.current.outputs.publish == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ github.token }}
+          publish_dir: dist
+          publish_branch: gh-pages
+          keep_files: true
+          force_orphan: false
+      - name: Check Pages source without changing a correct existing setup
+        if: steps.current.outputs.publish == 'true'
+        run: node scripts/configure-website-pages.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Deploy the static branch with its pinned Pages workflow
+        if: steps.current.outputs.publish == 'true'
+        run: gh workflow run deploy-static.yml --ref gh-pages --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Verify the actual public website and available download bytes
+        if: steps.current.outputs.publish == 'true'
+        run: node scripts/check-website.mjs
+        env:
+          PUBLIC_SITE_URL: ${{ vars.INHOUSE_LINK_SITE_URL || 'https://miguelcoxcaballero.github.io/inhouse-games/' }}
